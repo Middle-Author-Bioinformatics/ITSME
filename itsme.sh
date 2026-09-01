@@ -19,7 +19,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 SECONDS=0
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 
 READS_1=""
 READS_2=""
@@ -94,6 +94,8 @@ CALL_VARIANTS=true
 VARIANT_MIN_MAPQ=10
 VARIANT_MIN_BASEQ=20
 VARIANT_MAX_DEPTH=100000
+SENSITIVITY_LEVEL=2
+SENSITIVITY_NAME="balanced"
 
 DATABASES=()
 LEFT_DATABASES=()
@@ -104,7 +106,7 @@ ASSEMBLY_SINGLE_FILES=()
 
 usage() {
     cat <<'EOF'
-ITSME v1.3.0 - variant-aware eukaryotic rDNA recruitment and classification
+ITSME v1.4.0 - variant-aware eukaryotic rDNA recruitment and classification
 
 Usage:
   itsme.sh -1 R1.fastq.gz -2 R2.fastq.gz \
@@ -139,6 +141,9 @@ Seed databases:
                                    extension [400]
 
 Recruitment:
+      --sensitivity LEVEL          Recruitment preset: 1/specific,
+                                   2/balanced, or 3/sensitive [2]
+                                   Explicit options override the preset
   -R, --max-rounds INT             Maximum word-extension rounds [3]
   -w, --word-size INT              Exact k-mer/word length [31]
       --min-word-hits INT          Minimum bait words required per read [3]
@@ -262,6 +267,8 @@ Conda installation:
 Notes:
   * Raw reads are mapped before QC. Trimmomatic and FLASH see only accepted
     rRNA-associated reads, not the full input library.
+  * --sensitivity 1, 2, and 3 select specific, balanced, and sensitive presets.
+    Any explicitly supplied recruitment or graph option overrides its preset.
   * Up to three guarded inward rounds are enabled by default. Each round scans
     the original reads with exact words from only the newest inward frontier.
     A fast single-k graph check stops more inward recruitment once the target
@@ -341,6 +348,97 @@ format_duration() {
         "$((total_seconds % 60))"
 }
 
+apply_sensitivity_preset() {
+    case "${1,,}" in
+        1|specific)
+            SENSITIVITY_LEVEL=1
+            SENSITIVITY_NAME="specific"
+            SEED_SCORE_MIN="G,25,10"
+            MIN_READ_ALIGNED_FRACTION=0.85
+            MIN_READ_IDENTITY=0.90
+            MAX_ROUNDS=2
+            WORD_SIZE=31
+            MIN_WORD_HITS=4
+            MAX_ROUND_GROWTH=2.0
+            MAX_ACCEPTED_FRACTION=0.03
+            MAX_ACCEPTED_TEMPLATES=100000
+            OUTWARD_MIN_WORD_HITS=6
+            MAX_OUTWARD_TEMPLATES=10000
+            MAX_OUTWARD_GROWTH=0.15
+            ANCHOR_MIN_ALIGNED=200
+            ANCHOR_MIN_IDENTITY=0.90
+            MIN_GRAPH_DEPTH=2.0
+            MAX_GRAPH_PATHS=250
+            MAX_GRAPH_NODES=30
+            GRAPH_STOP_NODES=300
+            ;;
+        2|balanced)
+            SENSITIVITY_LEVEL=2
+            SENSITIVITY_NAME="balanced"
+            SEED_SCORE_MIN="G,20,8"
+            MIN_READ_ALIGNED_FRACTION=0.75
+            MIN_READ_IDENTITY=0.85
+            MAX_ROUNDS=3
+            WORD_SIZE=31
+            MIN_WORD_HITS=3
+            MAX_ROUND_GROWTH=3.0
+            MAX_ACCEPTED_FRACTION=0.07
+            MAX_ACCEPTED_TEMPLATES=250000
+            OUTWARD_MIN_WORD_HITS=5
+            MAX_OUTWARD_TEMPLATES=25000
+            MAX_OUTWARD_GROWTH=0.25
+            ANCHOR_MIN_ALIGNED=150
+            ANCHOR_MIN_IDENTITY=0.85
+            MIN_GRAPH_DEPTH=1.0
+            MAX_GRAPH_PATHS=500
+            MAX_GRAPH_NODES=40
+            GRAPH_STOP_NODES=500
+            ;;
+        3|sensitive)
+            SENSITIVITY_LEVEL=3
+            SENSITIVITY_NAME="sensitive"
+            SEED_SCORE_MIN="G,10,4"
+            MIN_READ_ALIGNED_FRACTION=0.60
+            MIN_READ_IDENTITY=0.75
+            MAX_ROUNDS=5
+            WORD_SIZE=25
+            MIN_WORD_HITS=2
+            MAX_ROUND_GROWTH=5.0
+            MAX_ACCEPTED_FRACTION=0.07
+            MAX_ACCEPTED_TEMPLATES=250000
+            OUTWARD_MIN_WORD_HITS=4
+            MAX_OUTWARD_TEMPLATES=25000
+            MAX_OUTWARD_GROWTH=0.50
+            ANCHOR_MIN_ALIGNED=100
+            ANCHOR_MIN_IDENTITY=0.75
+            MIN_GRAPH_DEPTH=0.5
+            MAX_GRAPH_PATHS=1000
+            MAX_GRAPH_NODES=60
+            GRAPH_STOP_NODES=500
+            ;;
+        *)
+            die "--sensitivity must be 1/specific, 2/balanced, or 3/sensitive."
+            ;;
+    esac
+}
+
+# Resolve the preset before ordinary option parsing so that every explicit
+# parameter overrides the preset regardless of command-line order.
+ORIGINAL_ARGS=("$@")
+for (( sensitivity_i = 0; sensitivity_i < ${#ORIGINAL_ARGS[@]}; sensitivity_i++ )); do
+    case "${ORIGINAL_ARGS[$sensitivity_i]}" in
+        --sensitivity)
+            (( sensitivity_i + 1 < ${#ORIGINAL_ARGS[@]} )) || \
+                die "Option --sensitivity requires a value."
+            apply_sensitivity_preset "${ORIGINAL_ARGS[$((sensitivity_i + 1))]}"
+            sensitivity_i=$((sensitivity_i + 1))
+            ;;
+        --sensitivity=*)
+            apply_sensitivity_preset "${ORIGINAL_ARGS[$sensitivity_i]#*=}"
+            ;;
+    esac
+done
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -1|--reads1)
@@ -367,6 +465,10 @@ while [[ $# -gt 0 ]]; do
             EXTENSION_DIRECTION="bidirectional"; shift ;;
         --inward-end-length)
             need_value "$@"; INWARD_END_LENGTH="$2"; shift 2 ;;
+        --sensitivity)
+            need_value "$@"; shift 2 ;;
+        --sensitivity=*)
+            shift ;;
         -R|--max-rounds)
             need_value "$@"; MAX_ROUNDS="$2"; shift 2 ;;
         -w|--word-size)
@@ -2923,6 +3025,7 @@ ELAPSED=$(format_duration "$SECONDS")
 
 printf '%s\n' \
     "ITSME version: $VERSION" \
+    "Sensitivity preset: $SENSITIVITY_LEVEL ($SENSITIVITY_NAME)" \
     "Raw paired templates: $RAW_PAIR_COUNT" \
     "Raw single reads: $RAW_SINGLE_COUNT" \
     "Seed-accepted templates: $(awk 'NR == 2 { print $5 }' "$METRICS")" \
