@@ -25,6 +25,18 @@ By default, ITSME performs one conservative extension round from the inward-faci
 
 ITSME uses Bash, Bowtie2, Samtools, SPAdes, BLAST+, Python 3, Trimmomatic, FLASH2, ITSx, and BBMap/BBDuk.
 
+Create and activate the software environment:
+
+```bash
+mamba create -n itsme \
+    -c conda-forge \
+    -c bioconda \
+    bowtie2 samtools spades blast itsx bbmap trimmomatic flash2 pigz seqkit \
+    --yes
+
+mamba activate itsme
+```
+
 Supply one database root with `--db-dir`. It should contain:
 
 ```text
@@ -42,10 +54,23 @@ itsme_db/
     └── merged.dmp
 ```
 
+Create this directory automatically in the current directory:
+
+```bash
+chmod +x setup_db.sh
+./setup_db.sh
+```
+
+Or choose a location:
+
+```bash
+./setup_db.sh --db-dir /home/ark/databases/itsme_db
+```
+
 ## Quick start
 
 ```bash
-chmod +x itsme.sh itsme_controller.sh
+chmod +x itsme.sh itsme_controller.sh setup_db.sh
 ```
 
 Run one paired library:
