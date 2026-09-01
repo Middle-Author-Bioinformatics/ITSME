@@ -7,7 +7,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 INPUT_DIR=""
 OUTPUT_DIR=""
 ITSME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/itsme.sh"
@@ -18,13 +18,13 @@ ITSME_ARGS=()
 
 usage() {
     cat <<'EOF'
-ITSME controller v1.0.0
+ITSME controller v1.1.0
 
 Run itsme.sh sequentially for every paired FASTQ library in a directory.
 
 Usage:
-  itsme_controller.sh -i FASTQ_DIR -o OUTPUT_DIR [controller options] -- \
-      [arguments passed to itsme.sh]
+  itsme_controller.sh -i FASTQ_DIR -o OUTPUT_DIR [controller options] \
+      [itsme.sh options]
 
 Required controller arguments:
   -i, --input-dir DIR       Directory containing paired FASTQ files
@@ -38,6 +38,10 @@ Controller options:
   -h, --help                Show this help
       --version             Show the controller version
 
+ITSME options:
+  All options not owned by the controller are passed directly to itsme.sh.
+  In particular, provide --db-dir normally; no separator is required.
+
 Input naming:
   The controller discovers files containing _R1 and ending in .fastq.gz.
   It replaces the first _R1 with _R2 to obtain the mate filename. The library
@@ -48,7 +52,6 @@ Example:
       -i /data/fastqs \
       -o /data/itsme_results \
       --resume \
-      -- \
       --db-dir /home/ark/databases/itsme_db
 
 Outputs:
@@ -60,7 +63,7 @@ Outputs:
 
 Notes:
   * Runs are sequential to avoid oversubscribing CPUs and memory.
-  * Do not pass -1, -2, or -o after --; the controller supplies them.
+  * Do not pass -1, -2, or a per-library -o; the controller supplies them.
   * With --resume, only directories containing both run_summary.txt and
     master_summary.csv are treated as completed.
 EOF
@@ -106,11 +109,12 @@ while (( $# > 0 )); do
         --version)
             printf '%s\n' "$VERSION"; exit 0 ;;
         --)
+            # Accepted for backward compatibility, but no longer required.
             shift
-            ITSME_ARGS=("$@")
+            ITSME_ARGS+=("$@")
             break ;;
         *)
-            die "Unknown controller option: $1. Put ITSME arguments after --." ;;
+            ITSME_ARGS+=("$1"); shift ;;
     esac
 done
 
@@ -128,7 +132,7 @@ ITSME=$(cd "$(dirname "$ITSME")" && pwd)/$(basename "$ITSME")
 for argument in "${ITSME_ARGS[@]}"; do
     case "$argument" in
         -1|--reads1|-2|--reads2|-o|--output-dir)
-            die "Do not pass $argument after --; the controller supplies input and output paths." ;;
+            die "Do not pass $argument to itsme.sh; the controller supplies input and output paths." ;;
     esac
 done
 

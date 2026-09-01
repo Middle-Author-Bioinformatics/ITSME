@@ -89,20 +89,18 @@ Run every paired library in a directory:
 ./itsme_controller.sh \
     -i /path/to/fastqs \
     -o /path/to/itsme_results \
-    -- \
     --db-dir /home/ark/databases/itsme_db
 ```
 
-The controller pairs `_R1` and `_R2` files, creates one result directory per library, and writes `batch_status.tsv` and `batch_master_summary.csv`. Arguments after `--` are passed to `itsme.sh`.
+The controller pairs `_R1` and `_R2` files, creates one result directory per library, and writes `batch_status.tsv` and `batch_master_summary.csv`. ITSME options such as `--db-dir`, `-t`, `-m`, and `-R` can be provided directly to the controller and are passed to every library run.
 
-Resume a batch by adding `--resume` before `--`:
+Resume a batch with `--resume`:
 
 ```bash
 ./itsme_controller.sh \
     -i /path/to/fastqs \
     -o /path/to/itsme_results \
     --resume \
-    -- \
     --db-dir /home/ark/databases/itsme_db
 ```
 
