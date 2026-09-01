@@ -18,7 +18,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 SECONDS=0
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 READS_1=""
 READS_2=""
@@ -72,6 +72,8 @@ NCBI_MAX_HITS=50
 NCBI_REPORT_HITS=10
 TAXDUMP_DIR="${NCBI_TAXDUMP_DIR:-}"
 TAXDUMP_DIR_EXPLICIT=false
+EXPECTED_TAXONOMY=""
+TAXONOMY_NEAR_TOP_FRACTION=0.95
 
 DATABASES=()
 LEFT_DATABASES=()
@@ -82,7 +84,7 @@ ASSEMBLY_SINGLE_FILES=()
 
 usage() {
     cat <<'EOF'
-ITSME v1.0.0 - validated eukaryotic rDNA recruitment and classification
+ITSME v1.1.0 - validated eukaryotic rDNA recruitment and classification
 
 Usage:
   itsme.sh -1 R1.fastq.gz -2 R2.fastq.gz \
@@ -162,6 +164,8 @@ Assembly and output:
                                    BLAST databases [auto-detected from --db-dir]
       --ncbi-max-hits INT         Maximum BLAST hits retained per query [50]
       --ncbi-report-hits INT      Top hits per locus in summary table [10]
+      --expected-taxonomy NAME    Expected clade at any rank, e.g.
+                                   Echinodermata; flags but never removes loci
       --ncbi-taxdump-dir DIR      NCBI taxdump directory containing nodes.dmp,
                                    names.dmp and optionally merged.dmp
                                    [auto-detected from --db-dir]
@@ -182,6 +186,7 @@ Principal outputs:
   OUTPUT/final/ncbi_ITS_hits.tsv
   OUTPUT/final/ncbi_LSU_hits.tsv
   OUTPUT/final/ncbi_blast_top_hits.tsv
+  OUTPUT/final/taxonomy_validation.tsv
   OUTPUT/final/rrna_locus_summary.tsv
   OUTPUT/final/master_summary.tsv
   OUTPUT/master_summary.csv
@@ -218,6 +223,8 @@ Notes:
   * ITSx runs only on oriented contigs, avoiding reverse-orientation artifacts.
   * NCBI classification uses the local SSU_eukaryote_rRNA,
     ITS_eukaryote_sequences and LSU_eukaryote_rRNA databases.
+  * All reconstructed rDNA candidates are retained regardless of taxonomic
+    status. Expected taxonomy is used only to classify and flag results.
 EOF
 }
 
@@ -375,6 +382,8 @@ while [[ $# -gt 0 ]]; do
             need_value "$@"; NCBI_MAX_HITS="$2"; shift 2 ;;
         --ncbi-report-hits)
             need_value "$@"; NCBI_REPORT_HITS="$2"; shift 2 ;;
+        --expected-taxonomy)
+            need_value "$@"; EXPECTED_TAXONOMY="$2"; shift 2 ;;
         --ncbi-taxdump-dir)
             need_value "$@"; TAXDUMP_DIR="$2"; TAXDUMP_DIR_EXPLICIT=true; shift 2 ;;
         --skip-ncbi-blast)
@@ -1368,19 +1377,28 @@ PY
 }
 
 build_locus_summary() {
-    python3 - "$OUTDIR/final" <<'PY'
+    python3 - "$OUTDIR/final" "$EXPECTED_TAXONOMY" \
+        "$TAXONOMY_NEAR_TOP_FRACTION" <<'PY'
 import csv, re, sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
+expected = sys.argv[2].strip()
+near_top_fraction = float(sys.argv[3])
+ranks = ('domain','kingdom','phylum','class','order','family','genus','species')
+
 def rows(path):
     if not path.exists() or path.stat().st_size == 0:
         return []
     with path.open() as handle:
         return list(csv.DictReader(handle, delimiter='\t'))
+
 def region_length(value):
     m = re.fullmatch(r'(\d+)-(\d+)', value or '')
     return str(abs(int(m.group(2)) - int(m.group(1))) + 1) if m else 'NA'
+
+def resolved(value):
+    return bool(value and value not in {'NA', 'N/A', 'Unclassified', 'unclassified'})
 
 layout = {r['contig']: r for r in rows(root / 'contig_validation.tsv')}
 itsx = {r['contig']: r for r in rows(root / 'itsx_validation.tsv')}
@@ -1389,21 +1407,108 @@ for r in rows(root / 'readback_coverage.tsv'):
     key = r.get('#rname') or r.get('rname')
     if key:
         coverage[key] = r
-best = {}
-for r in rows(root / 'ncbi_blast_top_hits.tsv'):
-    if r['rank'] == '1':
-        best[(r['query'], r['marker'])] = r
+
+all_hits = rows(root / 'ncbi_blast_top_hits.tsv')
+best, grouped = {}, {}
+for row in all_hits:
+    grouped.setdefault((row['query'], row['marker']), []).append(row)
+    if row['rank'] == '1':
+        best[(row['query'], row['marker'])] = row
 
 def hit(contig, marker, field):
     return best.get((contig, marker), {}).get(field, 'NA') or 'NA'
 
-fields = ['contig','contig_length','orientation','layout_status','structure_status',
+def marker_consensus(contig, marker):
+    marker_hits = grouped.get((contig, marker), [])
+    if not marker_hits:
+        return {rank: 'NA' for rank in ranks}, 0
+    top_bitscore = max(float(row['bitscore']) for row in marker_hits)
+    selected = [row for row in marker_hits
+                if float(row['bitscore']) >= top_bitscore * near_top_fraction]
+    consensus = {rank: 'NA' for rank in ranks}
+    for rank in ranks:
+        values = {row[rank].strip() for row in selected if resolved(row.get(rank, ''))}
+        if len(values) != 1:
+            break
+        consensus[rank] = values.pop()
+    return consensus, len(selected)
+
+def lineage_text(consensus):
+    values = [consensus[rank] for rank in ranks if resolved(consensus.get(rank, ''))]
+    return '; '.join(values) if values else 'NA'
+
+def locus_consensus(ssu, lsu):
+    consensus = {rank: 'NA' for rank in ranks}
+    for rank in ranks:
+        left, right = ssu.get(rank, 'NA'), lsu.get(rank, 'NA')
+        if not resolved(left) or not resolved(right) or left.casefold() != right.casefold():
+            break
+        consensus[rank] = left
+    return consensus
+
+def taxonomy_result(contig):
+    ssu, ssu_n = marker_consensus(contig, 'SSU')
+    its, its_n = marker_consensus(contig, 'ITS')
+    lsu, lsu_n = marker_consensus(contig, 'LSU')
+    combined = locus_consensus(ssu, lsu)
+    ssu_phylum, lsu_phylum = ssu.get('phylum', 'NA'), lsu.get('phylum', 'NA')
+
+    note = ''
+    if (resolved(ssu_phylum) and resolved(lsu_phylum) and
+            ssu_phylum.casefold() != lsu_phylum.casefold()):
+        status = 'FAIL_taxonomic_chimera'
+        note = f'SSU phylum {ssu_phylum} conflicts with LSU phylum {lsu_phylum}'
+    elif not resolved(ssu_phylum) or not resolved(lsu_phylum):
+        status = 'UNRESOLVED'
+        note = 'SSU or LSU consensus was unresolved at phylum'
+    elif expected:
+        lineage_names = {value.casefold() for value in combined.values() if resolved(value)}
+        if expected.casefold() in lineage_names:
+            status = 'PASS_expected_taxon'
+        else:
+            status = 'PASS_non_target_taxon'
+            note = f'Consensus lineage does not contain expected taxon {expected}'
+    else:
+        status = 'PASS_taxonomically_coherent'
+
+    return {
+        'taxonomy_status': status,
+        'expected_taxonomy': expected or 'NA',
+        **{f'consensus_{rank}': combined[rank] for rank in ranks},
+        'consensus_taxonomy': lineage_text(combined),
+        'SSU_consensus_taxonomy': lineage_text(ssu),
+        'ITS_consensus_taxonomy': lineage_text(its),
+        'LSU_consensus_taxonomy': lineage_text(lsu),
+        'SSU_near_top_hits': str(ssu_n),
+        'ITS_near_top_hits': str(its_n),
+        'LSU_near_top_hits': str(lsu_n),
+        'validation_note': note or 'NA'
+    }
+
+taxonomy_fields = ['contig','taxonomy_status','expected_taxonomy',
+                   *[f'consensus_{rank}' for rank in ranks],
+                   'consensus_taxonomy','SSU_consensus_taxonomy',
+                   'ITS_consensus_taxonomy','LSU_consensus_taxonomy',
+                   'SSU_near_top_hits','ITS_near_top_hits','LSU_near_top_hits',
+                   'validation_note']
+taxonomy = {contig: taxonomy_result(contig) for contig in itsx}
+with (root / 'taxonomy_validation.tsv').open('w', newline='') as handle:
+    out = csv.DictWriter(handle, fieldnames=taxonomy_fields, delimiter='\t', lineterminator='\n')
+    out.writeheader()
+    for contig in sorted(taxonomy):
+        out.writerow({'contig': contig, **taxonomy[contig]})
+
+detailed_fields = ['contig','contig_length','orientation','layout_status','structure_status',
           'SSU_coordinates','SSU_bp','ITS1_coordinates','ITS1_bp','5.8S_coordinates','5.8S_bp',
           'ITS2_coordinates','ITS2_bp','LSU_coordinates','LSU_bp',
           '18S_anchor_identity','28S_anchor_identity','readback_coverage_percent','readback_mean_depth',
-          'readback_mean_mapq']
+          'readback_mean_mapq','taxonomy_status','expected_taxonomy',
+          *[f'consensus_{rank}' for rank in ranks],
+          'consensus_taxonomy','SSU_consensus_taxonomy','ITS_consensus_taxonomy',
+          'LSU_consensus_taxonomy','SSU_near_top_hits','ITS_near_top_hits',
+          'LSU_near_top_hits','validation_note']
 for marker in ('SSU','ITS','LSU'):
-    fields += [f'{marker}_top_accession',f'{marker}_top_scientific_name',
+    detailed_fields += [f'{marker}_top_accession',f'{marker}_top_scientific_name',
                f'{marker}_top_domain',f'{marker}_top_kingdom',f'{marker}_top_phylum',
                f'{marker}_top_class',f'{marker}_top_order',f'{marker}_top_family',
                f'{marker}_top_genus',f'{marker}_top_species',
@@ -1412,7 +1517,7 @@ for marker in ('SSU','ITS','LSU'):
                f'{marker}_top_bitscore',f'{marker}_top_title']
 
 with (root / 'rrna_locus_summary.tsv').open('w', newline='') as handle:
-    out = csv.DictWriter(handle, fieldnames=fields, delimiter='\t', lineterminator='\n')
+    out = csv.DictWriter(handle, fieldnames=detailed_fields, delimiter='\t', lineterminator='\n')
     out.writeheader()
     for contig in sorted(itsx):
         x, l, c = itsx[contig], layout.get(contig, {}), coverage.get(contig, {})
@@ -1427,6 +1532,7 @@ with (root / 'rrna_locus_summary.tsv').open('w', newline='') as handle:
         for marker in ('SSU','ITS1','5.8S','ITS2','LSU'):
             row[f'{marker}_coordinates'] = x.get(marker, 'NA')
             row[f'{marker}_bp'] = region_length(x.get(marker, ''))
+        row.update(taxonomy[contig])
         for marker in ('SSU','ITS','LSU'):
             mapping = {'accession':'accession','scientific_name':'scientific_names',
                        'domain':'domain','kingdom':'kingdom','phylum':'phylum',
@@ -1438,16 +1544,44 @@ with (root / 'rrna_locus_summary.tsv').open('w', newline='') as handle:
             for suffix, source in mapping.items():
                 row[f'{marker}_top_{suffix}'] = hit(contig, marker, source)
         out.writerow(row)
-    
-(root / 'master_summary.tsv').write_text((root / 'rrna_locus_summary.tsv').read_text())
 
-# Write a spreadsheet-friendly copy to the root output directory. Using the
-# csv module preserves commas, quotes, and other punctuation in BLAST titles.
-with (root / 'rrna_locus_summary.tsv').open(newline='') as source, \
-     (root.parent / 'master_summary.csv').open('w', newline='') as destination:
-    reader = csv.reader(source, delimiter='\t')
-    writer = csv.writer(destination, lineterminator='\n')
-    writer.writerows(reader)
+# Keep the master summaries intentionally concise. The complete audit table
+# remains available as rrna_locus_summary.tsv.
+master_fields = ['contig','length_bp','regions','mean_depth','taxonomy_status',
+                 'consensus_taxonomy','expected_taxonomy',
+                 'SSU_top_hit','SSU_identity','SSU_aligned_bp',
+                 'ITS_top_hit','ITS_identity','ITS_aligned_bp',
+                 'LSU_top_hit','LSU_identity','LSU_aligned_bp']
+master_rows = []
+for contig in sorted(itsx):
+    x, c, tax = itsx[contig], coverage.get(contig, {}), taxonomy[contig]
+    regions = '; '.join(f'{marker}={x.get(marker, "NA")}'
+                        for marker in ('SSU','ITS1','5.8S','ITS2','LSU'))
+    master_rows.append({
+        'contig': contig, 'length_bp': x.get('length','NA'), 'regions': regions,
+        'mean_depth': c.get('meandepth','NA'),
+        'taxonomy_status': tax['taxonomy_status'],
+        'consensus_taxonomy': tax['consensus_taxonomy'],
+        'expected_taxonomy': tax['expected_taxonomy'],
+        'SSU_top_hit': hit(contig,'SSU','scientific_names'),
+        'SSU_identity': hit(contig,'SSU','percent_identity'),
+        'SSU_aligned_bp': hit(contig,'SSU','aligned_bp'),
+        'ITS_top_hit': hit(contig,'ITS','scientific_names'),
+        'ITS_identity': hit(contig,'ITS','percent_identity'),
+        'ITS_aligned_bp': hit(contig,'ITS','aligned_bp'),
+        'LSU_top_hit': hit(contig,'LSU','scientific_names'),
+        'LSU_identity': hit(contig,'LSU','percent_identity'),
+        'LSU_aligned_bp': hit(contig,'LSU','aligned_bp')
+    })
+
+with (root / 'master_summary.tsv').open('w', newline='') as destination:
+    writer = csv.DictWriter(destination, fieldnames=master_fields, delimiter='\t', lineterminator='\n')
+    writer.writeheader()
+    writer.writerows(master_rows)
+with (root.parent / 'master_summary.csv').open('w', newline='') as destination:
+    writer = csv.DictWriter(destination, fieldnames=master_fields, lineterminator='\n')
+    writer.writeheader()
+    writer.writerows(master_rows)
 PY
 }
 
@@ -1728,6 +1862,7 @@ else
     : > "$OUTDIR/final/ncbi_ITS_hits.tsv"
     : > "$OUTDIR/final/ncbi_LSU_hits.tsv"
     : > "$OUTDIR/final/ncbi_blast_top_hits.tsv"
+    : > "$OUTDIR/final/taxonomy_validation.tsv"
     : > "$OUTDIR/final/rrna_locus_summary.tsv"
     : > "$OUTDIR/final/master_summary.tsv"
     : > "$OUTDIR/master_summary.csv"
@@ -1742,6 +1877,16 @@ done
 read -r ALL_CONTIG_COUNT ALL_BP < <(fasta_stats "$ALL_CONTIGS")
 read -r CANDIDATE_COUNT CANDIDATE_BP < <(fasta_stats "$CANDIDATE_CONTIGS")
 read -r COMPLETE_ITS_COUNT COMPLETE_ITS_BP < <(fasta_stats "$OUTDIR/final/complete_ITS.fasta")
+EXPECTED_PASS_COUNT=$(awk -F '\t' 'NR > 1 && $2 == "PASS_expected_taxon" { n++ } END { print n + 0 }' \
+    "$OUTDIR/final/taxonomy_validation.tsv")
+NON_TARGET_COUNT=$(awk -F '\t' 'NR > 1 && $2 == "PASS_non_target_taxon" { n++ } END { print n + 0 }' \
+    "$OUTDIR/final/taxonomy_validation.tsv")
+COHERENT_TAXONOMY_COUNT=$(awk -F '\t' 'NR > 1 && $2 == "PASS_taxonomically_coherent" { n++ } END { print n + 0 }' \
+    "$OUTDIR/final/taxonomy_validation.tsv")
+TAXONOMIC_CHIMERA_COUNT=$(awk -F '\t' 'NR > 1 && $2 == "FAIL_taxonomic_chimera" { n++ } END { print n + 0 }' \
+    "$OUTDIR/final/taxonomy_validation.tsv")
+UNRESOLVED_TAXONOMY_COUNT=$(awk -F '\t' 'NR > 1 && $2 == "UNRESOLVED" { n++ } END { print n + 0 }' \
+    "$OUTDIR/final/taxonomy_validation.tsv")
 FINAL_PAIR_COUNT=$(fastq_count "$FINAL_R1")
 FINAL_SINGLE_COUNT=$(fastq_count "$FINAL_SINGLE")
 ELAPSED=$(format_duration "$SECONDS")
@@ -1771,6 +1916,12 @@ printf '%s\n' \
     "Ambiguous dual-anchor contigs: $AMBIGUOUS_COUNT" \
     "Complete ITS regions: $COMPLETE_ITS_COUNT" \
     "Complete ITS bp: $COMPLETE_ITS_BP" \
+    "Expected taxonomy: ${EXPECTED_TAXONOMY:-NA}" \
+    "Expected-taxonomy loci: $EXPECTED_PASS_COUNT" \
+    "Non-target loci: $NON_TARGET_COUNT" \
+    "Taxonomically coherent loci without an expected-clade test: $COHERENT_TAXONOMY_COUNT" \
+    "Taxonomic-chimera loci: $TAXONOMIC_CHIMERA_COUNT" \
+    "Unresolved-taxonomy loci: $UNRESOLVED_TAXONOMY_COUNT" \
     "NCBI targeted BLAST enabled: $RUN_NCBI_BLAST" \
     "NCBI BLAST database directory: ${NCBI_DB_DIR:-NA}" \
     "NCBI taxdump directory: ${TAXDUMP_DIR:-NA}" \
@@ -1787,6 +1938,7 @@ log "Oriented validated contigs: $OUTDIR/final/oriented_dual_anchor_contigs.fast
 log "Complete ITS regions: $OUTDIR/final/complete_ITS.fasta"
 log "Validation report: $OUTDIR/final/contig_validation.tsv"
 log "NCBI top hits: $OUTDIR/final/ncbi_blast_top_hits.tsv"
+log "Taxonomy validation: $OUTDIR/final/taxonomy_validation.tsv"
 log "Integrated locus summary: $OUTDIR/final/rrna_locus_summary.tsv"
 log "Master summary: $OUTDIR/final/master_summary.tsv"
 log "Master summary CSV: $OUTDIR/master_summary.csv"
