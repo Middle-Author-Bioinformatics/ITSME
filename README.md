@@ -162,6 +162,46 @@ The output directory must be new or empty.
 
 `itsme_controller.sh` runs ITSME over a directory of paired FASTQ libraries. It discovers filenames containing `_R1`, derives each mate by replacing the first `_R1` with `_R2`, and uses everything before `_R1` as the library prefix and output-subdirectory name.
 
+For example, this pair:
+
+```text
+resub-M10195-OS-SKQ23_R1_001.fastq.gz
+resub-M10195-OS-SKQ23_R2_001.fastq.gz
+```
+
+is processed as library `resub-M10195-OS-SKQ23` and written beneath `OUTPUT_DIR/resub-M10195-OS-SKQ23/`.
+
+### Minimal batch run
+
+The following command uses the default ITSME settings: 8 threads, a 32 GB SPAdes memory limit, automatic k-mer selection, post-map QC, one guarded inward extension round, assembly, ITSx validation, read-back mapping, and NCBI rRNA/ITS assessment.
+
+```bash
+./itsme_controller.sh \
+    -i /home/mab/NOAA/20250201_Mitogenomes_ArcticSKQ23/reads/tt4 \
+    -o /home/mab/NOAA/20250201_Mitogenomes_ArcticSKQ23/reads/tt4/itsme_v1_results \
+    -- \
+    --db-dir /home/ark/databases/itsme_db
+```
+
+The standalone `--` separates controller options from options passed to `itsme.sh`. Put `-i`, the parent `-o`, `--resume`, `--dry-run`, and other controller options before it. Put `--db-dir`, extension settings, assembly resources, and other ITSME options after it. The controller supplies `-1`, `-2`, and the per-library `-o`; do not provide those options after `--`.
+
+### Inspect commands without running
+
+Use `--dry-run` to verify pairing, output names, and the complete command for every library:
+
+```bash
+./itsme_controller.sh \
+    -i /path/to/fastqs \
+    -o /path/to/itsme_results \
+    --dry-run \
+    -- \
+    --db-dir /home/ark/databases/itsme_db
+```
+
+### Resume a batch
+
+`--resume` skips libraries whose output directories contain both `run_summary.txt` and `master_summary.csv`. It does not restart incomplete ITSME runs internally; an incomplete, nonempty library directory is reported as blocked so that existing data are not overwritten.
+
 ```bash
 ./itsme_controller.sh \
     -i /path/to/fastqs \
@@ -171,7 +211,69 @@ The output directory must be new or empty.
     --db-dir /home/ark/databases/itsme_db
 ```
 
-Arguments after `--` are passed directly to `itsme.sh`. The controller supplies `-1`, `-2`, and `-o` for each library and runs libraries sequentially to prevent CPU and memory oversubscription.
+### Higher-resource assembly
+
+The following overrides the resource and SPAdes defaults for a machine where 24 threads and up to 200 GB of memory are available:
+
+```bash
+./itsme_controller.sh \
+    -i /path/to/fastqs \
+    -o /path/to/itsme_results \
+    --resume \
+    -- \
+    --db-dir /home/ark/databases/itsme_db \
+    -t 24 \
+    -m 200 \
+    -k 21,45,65,85,105
+```
+
+### Seed recruitment without word extension
+
+Set `-R 0` to assemble only the reads recruited by seed mapping and their retained mates:
+
+```bash
+./itsme_controller.sh \
+    -i /path/to/fastqs \
+    -o /path/to/itsme_seed_only \
+    -- \
+    --db-dir /home/ark/databases/itsme_db \
+    -R 0
+```
+
+### Conservative outward extension
+
+Outward mode initializes word extension from the complete seed-hit frontier rather than only the inward-facing 18S and 28S termini. Because conserved rRNA can recruit unrelated flanking sequence, use tighter growth and total-recruitment limits:
+
+```bash
+./itsme_controller.sh \
+    -i /path/to/fastqs \
+    -o /path/to/itsme_outward \
+    -- \
+    --db-dir /home/ark/databases/itsme_db \
+    --outward \
+    -R 1 \
+    -w 31 \
+    --min-word-hits 3 \
+    --max-round-growth 0.10 \
+    --max-accepted-fraction 0.01
+```
+
+This option conservatively limits read recruitment; it does not yet perform graph-aware truncation at the first outward assembly-graph junction.
+
+### Controller options
+
+| Option | Description |
+|---|---|
+| `-i`, `--input-dir DIR` | Directory containing paired `*.fastq.gz` libraries |
+| `-o`, `--output-dir DIR` | Parent directory for all per-library results |
+| `--itsme FILE` | Use a specific `itsme.sh` executable instead of the copy beside the controller |
+| `--resume` | Skip libraries with completed result directories |
+| `--stop-on-error` | Stop the batch after the first failed or blocked library |
+| `--dry-run` | Print the derived commands without executing them |
+
+The controller runs libraries sequentially to prevent CPU and memory oversubscription.
+
+### Batch outputs
 
 The controller creates:
 
@@ -180,7 +282,18 @@ The controller creates:
 - `batch_status.tsv` with success, failure, and runtime information; and
 - `batch_master_summary.csv`, combining all available per-library master summaries with a leading `library` column.
 
-Use `--dry-run` to inspect commands without running them. Use `--resume` to skip output directories containing both `run_summary.txt` and `master_summary.csv`.
+Useful checks after or during a batch are:
+
+```bash
+# Summarize completion status and elapsed time.
+column -t -s $'\t' /path/to/itsme_results/batch_status.tsv
+
+# Inspect the combined per-sequence results.
+less -S /path/to/itsme_results/batch_master_summary.csv
+
+# Follow one active library log.
+tail -f /path/to/itsme_results/logs/LIBRARY.log
+```
 
 ## Important options
 
