@@ -20,7 +20,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 SECONDS=0
 
-VERSION="1.5.0"
+VERSION="1.5.1"
 
 READS_1=""
 READS_2=""
@@ -107,7 +107,7 @@ ASSEMBLY_SINGLE_FILES=()
 
 usage() {
     cat <<'EOF'
-ITSME v1.5.0 - contig-focused eukaryotic rDNA recruitment and classification
+ITSME v1.5.1 - contig-focused eukaryotic rDNA recruitment and classification
 
 Usage:
   itsme.sh -1 R1.fastq.gz -2 R2.fastq.gz \
@@ -2214,7 +2214,18 @@ if (taxdump / 'merged.dmp').exists():
             f = [x.strip() for x in line.split('|')]
             merged[f[0]] = f[1]
 
-wanted = ('superkingdom','kingdom','phylum','class','order','family','genus','species')
+output_ranks = ('domain','kingdom','phylum','class','order','family','genus','species')
+rank_alias = {
+    'domain': 'domain',
+    'superkingdom': 'domain',
+    'kingdom': 'kingdom',
+    'phylum': 'phylum',
+    'class': 'class',
+    'order': 'order',
+    'family': 'family',
+    'genus': 'genus',
+    'species': 'species',
+}
 def lineage(taxids):
     taxid = next((x for x in taxids.replace(',', ';').split(';') if x.isdigit()), '')
     while taxid in merged:
@@ -2223,14 +2234,14 @@ def lineage(taxids):
     current = taxid
     while current and current not in seen and current in parents:
         seen.add(current)
-        rank = ranks.get(current, '')
-        if rank in wanted and rank not in found:
+        rank = rank_alias.get(ranks.get(current, ''))
+        if rank and rank not in found:
             found[rank] = names.get(current, 'NA')
         parent = parents[current]
         if parent == current:
             break
         current = parent
-    return [found.get(rank, 'NA') for rank in wanted], names.get(taxid, 'NA')
+    return [found.get(rank, 'NA') for rank in output_ranks], names.get(taxid, 'NA')
 
 with open(out_path, 'a') as out:
     for spec in specs:
@@ -2330,6 +2341,8 @@ def marker_consensus(contig, marker):
     consensus = {rank: 'NA' for rank in ranks}
     for rank in ranks:
         values = {row[rank].strip() for row in selected if resolved(row.get(rank, ''))}
+        if not values:
+            continue
         if len(values) != 1:
             break
         consensus[rank] = values.pop()
@@ -2343,7 +2356,9 @@ def locus_consensus(ssu, lsu):
     consensus = {rank: 'NA' for rank in ranks}
     for rank in ranks:
         left, right = ssu.get(rank, 'NA'), lsu.get(rank, 'NA')
-        if not resolved(left) or not resolved(right) or left.casefold() != right.casefold():
+        if not resolved(left) or not resolved(right):
+            continue
+        if left.casefold() != right.casefold():
             break
         consensus[rank] = left
     return consensus
