@@ -19,7 +19,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 SECONDS=0
 
-VERSION="1.4.0"
+VERSION="1.4.1"
 
 READS_1=""
 READS_2=""
@@ -106,7 +106,7 @@ ASSEMBLY_SINGLE_FILES=()
 
 usage() {
     cat <<'EOF'
-ITSME v1.4.0 - variant-aware eukaryotic rDNA recruitment and classification
+ITSME v1.4.1 - variant-aware eukaryotic rDNA recruitment and classification
 
 Usage:
   itsme.sh -1 R1.fastq.gz -2 R2.fastq.gz \
@@ -3008,7 +3008,7 @@ read -r CANDIDATE_COUNT CANDIDATE_BP < <(fasta_stats "$CANDIDATE_CONTIGS")
 read -r COMPLETE_ITS_COUNT COMPLETE_ITS_BP < <(fasta_stats "$OUTDIR/final/complete_ITS.fasta")
 read -r GRAPH_PATH_COUNT GRAPH_PATH_BP < <(fasta_stats "$OUTDIR/final/graph_candidate_paths.fasta")
 read -r PARTIAL_LOCUS_COUNT PARTIAL_LOCUS_BP < <(fasta_stats "$OUTDIR/final/partial_locus_contigs.fasta")
-VARIANT_COUNT=$(awk 'END { print NR > 0 ? NR - 1 : 0 }' "$OUTDIR/final/residual_variants.tsv")
+VARIANT_COUNT=$(awk 'END { print (NR > 0 ? NR - 1 : 0) }' "$OUTDIR/final/residual_variants.tsv")
 EXPECTED_PASS_COUNT=$(awk -F '\t' 'NR > 1 && ($3 == "PASS_expected_taxon" || $3 == "PARTIAL_expected_taxon") { n++ } END { print n + 0 }' \
     "$OUTDIR/final/taxonomy_validation.tsv")
 NON_TARGET_COUNT=$(awk -F '\t' 'NR > 1 && ($3 == "PASS_non_target_taxon" || $3 == "PARTIAL_non_target_taxon") { n++ } END { print n + 0 }' \
