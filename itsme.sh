@@ -9,17 +9,18 @@
 #   4. Extend inward and conservatively outward with frontier-only exact k-mers.
 #   5. Reject abnormal recruitment before it can enter the assembly.
 #   6. Assemble the final accepted pool once with SPAdes.
-#   7. Enumerate bounded 18S-to-28S paths through the SPAdes graph.
-#   8. Report complete paths, partial loci, read support, and residual variants.
+#   7. Use the graph to monitor complexity and optionally enumerate diagnostics.
+#   8. Report only native final SPAdes contigs, their regions, and read support.
 #
-# This is not GetOrganelle. Graph paths are read-supported candidate sequences;
-# short reads cannot prove long-range phase across every rDNA repeat variant.
+# This is not GetOrganelle. Short reads cannot prove long-range phase across
+# every rDNA repeat variant, so inferred graph paths are never mixed with the
+# reportable native SPAdes contigs.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 SECONDS=0
 
-VERSION="1.4.1"
+VERSION="1.5.0"
 
 READS_1=""
 READS_2=""
@@ -80,7 +81,7 @@ TAXDUMP_DIR="${NCBI_TAXDUMP_DIR:-}"
 TAXDUMP_DIR_EXPLICIT=false
 EXPECTED_TAXONOMY=""
 TAXONOMY_NEAR_TOP_FRACTION=0.95
-GRAPH_PATHS=true
+GRAPH_PATHS=false
 MAX_GRAPH_PATHS=500
 MAX_GRAPH_NODES=40
 MAX_GRAPH_BP=25000
@@ -106,7 +107,7 @@ ASSEMBLY_SINGLE_FILES=()
 
 usage() {
     cat <<'EOF'
-ITSME v1.4.1 - variant-aware eukaryotic rDNA recruitment and classification
+ITSME v1.5.0 - contig-focused eukaryotic rDNA recruitment and classification
 
 Usage:
   itsme.sh -1 R1.fastq.gz -2 R2.fastq.gz \
@@ -191,8 +192,10 @@ Assembly and output:
       --anchor-min-aligned INT     Minimum seed alignment on a contig [150]
       --anchor-min-identity FLOAT  Minimum contig seed-hit identity [0.85]
       --layout-overlap INT         Maximum allowed 18S/28S overlap [25]
-      --skip-graph-paths           Do not enumerate alternative GFA paths
-      --max-graph-paths INT        Maximum complete graph paths reported [500]
+      --enumerate-graph-paths      Write inferred GFA paths as diagnostics;
+                                   never include them in contig reports [off]
+      --skip-graph-paths           Disable diagnostic GFA path enumeration
+      --max-graph-paths INT        Maximum diagnostic graph paths [500]
       --max-graph-nodes INT        Maximum segments in one graph path [40]
       --max-graph-bp INT           Maximum candidate path length [25000]
       --min-graph-depth FLOAT      Minimum segment k-mer depth in a path [1.0]
@@ -228,8 +231,6 @@ Assembly and output:
 
 Principal outputs:
   OUTPUT/final/rrna_candidate_contigs.fasta
-  OUTPUT/final/graph_candidate_paths.fasta
-  OUTPUT/final/all_locus_candidates.fasta
   OUTPUT/final/partial_18S_contigs.fasta
   OUTPUT/final/partial_28S_contigs.fasta
   OUTPUT/final/rrna_dual_anchor_contigs.fasta
@@ -237,7 +238,7 @@ Principal outputs:
   OUTPUT/final/complete_ITS.fasta
   OUTPUT/final/contig_validation.tsv
   OUTPUT/final/readback_coverage.tsv
-  OUTPUT/final/path_support.tsv
+  OUTPUT/final/contig_support.tsv
   OUTPUT/final/residual_variants.vcf.gz
   OUTPUT/final/residual_variants.tsv
   OUTPUT/final/ncbi_SSU_hits.tsv
@@ -281,16 +282,16 @@ Notes:
   * Recruitment is bounded by both a library fraction and an absolute template
     ceiling. Checkpoint SPAdes uses one k-mer; the full multi-k SPAdes assembly
     is run once after recruitment stops.
-  * ITSME enumerates bounded graph paths between compatible 18S and 28S
-    anchors. It stops at the anchor segments rather than choosing branches
-    beyond the locus.
+  * Final biological reports contain only native NODE_ contigs emitted by the
+    post-extension SPAdes assembly. Optional --enumerate-graph-paths output is
+    diagnostic and remains under validation/; it is never merged into reports.
   * Dual-anchor contigs are validated for non-overlapping, consistently
     oriented 18S and 28S anchors and automatically oriented 18S-to-28S.
   * ITSx runs only on oriented contigs, avoiding reverse-orientation artifacts.
   * NCBI classification uses the local SSU_eukaryote_rRNA,
     ITS_eukaryote_sequences and LSU_eukaryote_rRNA databases.
-  * Complete paths and partial 18S/28S loci are retained regardless of taxon.
-    Residual VCF records are unphased; graph paths are candidate haplotypes.
+  * Complete and partial native contigs are retained regardless of taxon.
+    Residual VCF records remain unphased.
 EOF
 }
 
@@ -541,6 +542,8 @@ while [[ $# -gt 0 ]]; do
             need_value "$@"; ANCHOR_MIN_IDENTITY="$2"; shift 2 ;;
         --layout-overlap)
             need_value "$@"; LAYOUT_OVERLAP_TOLERANCE="$2"; shift 2 ;;
+        --enumerate-graph-paths)
+            GRAPH_PATHS=true; shift ;;
         --skip-graph-paths)
             GRAPH_PATHS=false; shift ;;
         --max-graph-paths)
@@ -1654,15 +1657,14 @@ enumerate_graph_paths() {
     local segment_map="$graph_dir/segment_map.tsv"
     local left_hits="$graph_dir/segments_vs_18S.tsv"
     local right_hits="$graph_dir/segments_vs_28S.tsv"
-    local paths="$OUTDIR/final/graph_candidate_paths.fasta"
-    local report="$OUTDIR/final/graph_path_summary.tsv"
+    local paths="$graph_dir/graph_candidate_paths.fasta"
+    local report="$graph_dir/graph_path_summary.tsv"
 
+    mkdir -p "$graph_dir"
     : > "$paths"
     printf 'path_id\tlength_bp\tnode_count\tminimum_graph_depth\tmean_graph_depth\tleft_segment\tright_segment\tnode_path\tjunction_positions\tpath_status\n' \
         > "$report"
     [[ "$GRAPH_PATHS" == true && -s "$graph" ]] || return 0
-    mkdir -p "$graph_dir"
-
     python3 - "$graph" "$nodes" "$segment_map" <<'PY'
 import sys
 from pathlib import Path
@@ -1881,17 +1883,15 @@ PY
     fi
 }
 
-merge_locus_candidates() {
-    local graph_paths="$OUTDIR/final/graph_candidate_paths.fasta"
+prepare_native_contig_candidates() {
     local contigs="$OUTDIR/final/rrna_candidate_contigs.fasta"
-    local output="$OUTDIR/final/all_locus_candidates.fasta"
-    local provenance="$OUTDIR/final/locus_candidate_provenance.tsv"
-    python3 - "$graph_paths" "$contigs" "$output" "$provenance" <<'PY'
-import hashlib, sys
+    local output="$OUTDIR/validation/native_contig_candidates.fasta"
+    local provenance="$OUTDIR/validation/native_contig_provenance.tsv"
+    python3 - "$contigs" "$output" "$provenance" <<'PY'
+import sys
 from pathlib import Path
 
-graph, contigs, output, provenance = map(Path, sys.argv[1:])
-comp = str.maketrans('ACGTRYMKBDHVN', 'TGCAYRKMVHDBN')
+contigs, output, provenance = map(Path, sys.argv[1:])
 
 def records(path):
     if not path.exists():
@@ -1911,31 +1911,23 @@ def records(path):
         if name is not None:
             yield name, description, ''.join(sequence).upper()
 
-seen = set()
 with output.open('w') as fasta, provenance.open('w') as table:
-    table.write('candidate\tsource\tsource_header\tlength_bp\n')
-    for source, path in (('graph_path', graph), ('spades_contig', contigs)):
-        for name, description, sequence in records(path):
-            reverse = sequence.translate(comp)[::-1]
-            canonical = min(sequence, reverse)
-            digest = hashlib.sha256(canonical.encode()).digest()
-            if digest in seen:
-                continue
-            seen.add(digest)
-            fasta.write(f'>{description}\n')
-            for start in range(0, len(sequence), 80):
-                fasta.write(sequence[start:start + 80] + '\n')
-            table.write(f'{name}\t{source}\t{description}\t{len(sequence)}\n')
+    table.write('contig\tsource\tsource_header\tlength_bp\n')
+    for name, description, sequence in records(contigs):
+        fasta.write(f'>{description}\n')
+        for start in range(0, len(sequence), 80):
+            fasta.write(sequence[start:start + 80] + '\n')
+        table.write(f'{name}\tspades_contig\t{description}\t{len(sequence)}\n')
 PY
 }
 
 catalog_locus_candidates() {
-    local candidates="$OUTDIR/final/all_locus_candidates.fasta"
+    local candidates="$OUTDIR/validation/native_contig_candidates.fasta"
     local left_names="$OUTDIR/final/left_anchor_contig_names.txt"
     local right_names="$OUTDIR/final/right_anchor_contig_names.txt"
     python3 - "$candidates" "$left_names" "$right_names" \
         "$OUTDIR/final/contig_validation.tsv" \
-        "$OUTDIR/final/locus_candidate_provenance.tsv" "$OUTDIR/final" <<'PY'
+        "$OUTDIR/validation/native_contig_provenance.tsv" "$OUTDIR/final" <<'PY'
 import csv, sys
 from pathlib import Path
 
@@ -1972,7 +1964,7 @@ with open(validation_path) as handle:
 provenance = {}
 with open(provenance_path) as handle:
     for row in csv.DictReader(handle, delimiter='\t'):
-        provenance[row['candidate']] = row.get('source', 'NA')
+        provenance[row['contig']] = row.get('source', 'NA')
 
 outputs = {
     'PARTIAL_18S': open(outdir / 'partial_18S_contigs.fasta', 'w'),
@@ -1981,7 +1973,7 @@ outputs = {
     'SEED_ANCHORED_OTHER': open(outdir / 'other_seed_anchored_contigs.fasta', 'w'),
 }
 catalog = open(outdir / 'locus_catalog.tsv', 'w')
-catalog.write('candidate\tlength_bp\tlocus_type\tsource\tlayout_status\n')
+catalog.write('contig\tlength_bp\tlocus_type\tsource\tlayout_status\n')
 
 for name in sorted(records):
     description, sequence = records[name]
@@ -2064,9 +2056,9 @@ run_competitive_readback() {
     local targets="$OUTDIR/final/oriented_dual_anchor_contigs.fasta"
     local readback_dir="$OUTDIR/validation/readback"
     : > "$OUTDIR/final/readback_coverage.tsv"
-    printf 'candidate\tlength_bp\tall_mapped_reads\tcoverage_percent\tmean_depth\tmean_mapq\tunique_mapped_reads\tunique_coverage_percent\tunique_mean_depth\tgraph_junctions\tjunctions_with_read_support\tminimum_junction_spanning_reads\n' \
-        > "$OUTDIR/final/path_support.tsv"
-    printf 'candidate\tposition\treference\talternate\tquality\ttotal_depth\tallele_depths\n' \
+    printf 'contig\tlength_bp\tall_mapped_reads\tcoverage_percent\tmean_depth\tmean_mapq\tunique_mapped_reads\tunique_coverage_percent\tunique_mean_depth\n' \
+        > "$OUTDIR/final/contig_support.tsv"
+    printf 'contig\tposition\treference\talternate\tquality\ttotal_depth\tallele_depths\n' \
         > "$OUTDIR/final/residual_variants.tsv"
     [[ "$READBACK" == true && -s "$targets" ]] || return 0
     mkdir -p "$readback_dir"
@@ -2089,14 +2081,10 @@ run_competitive_readback() {
     samtools index "$readback_dir/candidates.mapq20.bam"
     samtools coverage "$readback_dir/candidates.mapq20.bam" \
         > "$readback_dir/coverage.mapq20.tsv"
-    samtools view -@ "$THREADS" -F 2308 \
-        -o "$readback_dir/primary_alignments.sam" "$readback_dir/candidates.bam"
     python3 - "$OUTDIR/final/readback_coverage.tsv" \
         "$readback_dir/coverage.mapq20.tsv" \
-        "$OUTDIR/final/graph_path_summary.tsv" \
-        "$readback_dir/primary_alignments.sam" \
-        "$OUTDIR/final/path_support.tsv" <<'PY'
-import csv, re, sys
+        "$OUTDIR/final/contig_support.tsv" <<'PY'
+import csv, sys
 
 def read(path):
     result = {}
@@ -2108,40 +2096,15 @@ def read(path):
     return result
 
 all_reads, unique = read(sys.argv[1]), read(sys.argv[2])
-junctions = {}
-with open(sys.argv[3]) as handle:
-    for row in csv.DictReader(handle, delimiter='\t'):
-        text = row.get('junction_positions', 'NA')
-        junctions[row['path_id']] = [] if text == 'NA' else [int(x) for x in text.split(',')]
-
-spanning = {name: [0] * len(positions) for name, positions in junctions.items()}
-cigar_pattern = re.compile(r'(\d+)([MIDNSHP=X])')
-with open(sys.argv[4]) as handle:
-    for line in handle:
-        if not line or line.startswith('@'):
-            continue
-        fields_row = line.rstrip('\n').split('\t')
-        if len(fields_row) < 6 or fields_row[2] not in junctions:
-            continue
-        start = int(fields_row[3])
-        reference_bases = sum(int(length) for length, operation in cigar_pattern.findall(fields_row[5])
-                              if operation in {'M','D','N','=','X'})
-        end = start + reference_bases - 1
-        for index, junction in enumerate(junctions[fields_row[2]]):
-            if start <= junction - 10 and end >= junction + 10:
-                spanning[fields_row[2]][index] += 1
-
-fields = ['candidate','length_bp','all_mapped_reads','coverage_percent','mean_depth',
-          'mean_mapq','unique_mapped_reads','unique_coverage_percent','unique_mean_depth',
-          'graph_junctions','junctions_with_read_support','minimum_junction_spanning_reads']
-with open(sys.argv[5], 'w', newline='') as handle:
+fields = ['contig','length_bp','all_mapped_reads','coverage_percent','mean_depth',
+          'mean_mapq','unique_mapped_reads','unique_coverage_percent','unique_mean_depth']
+with open(sys.argv[3], 'w', newline='') as handle:
     out = csv.DictWriter(handle, fieldnames=fields, delimiter='\t', lineterminator='\n')
     out.writeheader()
     for name in sorted(all_reads):
         overall, high = all_reads[name], unique.get(name, {})
-        counts = spanning.get(name, [])
         out.writerow({
-            'candidate': name,
+            'contig': name,
             'length_bp': overall.get('endpos', 'NA'),
             'all_mapped_reads': overall.get('numreads', '0'),
             'coverage_percent': overall.get('coverage', '0'),
@@ -2149,12 +2112,8 @@ with open(sys.argv[5], 'w', newline='') as handle:
             'mean_mapq': overall.get('meanmapq', '0'),
             'unique_mapped_reads': high.get('numreads', '0'),
             'unique_coverage_percent': high.get('coverage', '0'),
-            'unique_mean_depth': high.get('meandepth', '0'),
-            'graph_junctions': len(counts) if name in junctions else 'NA',
-            'junctions_with_read_support': sum(value > 0 for value in counts) if name in junctions else 'NA',
-            'minimum_junction_spanning_reads': min(counts) if counts else ('NA' if name not in junctions else 0)})
+            'unique_mean_depth': high.get('meandepth', '0')})
 PY
-    [[ "$KEEP_INTERMEDIATES" == true ]] || rm -f -- "$readback_dir/primary_alignments.sam"
 
     if [[ "$CALL_VARIANTS" == true ]]; then
         samtools faidx "$targets"
@@ -2169,7 +2128,7 @@ PY
         bcftools query \
             -f '%CHROM\t%POS\t%REF\t%ALT\t%QUAL\t%INFO/DP[\t%AD]\n' \
             "$OUTDIR/final/residual_variants.vcf.gz" | \
-            awk 'BEGIN { OFS="\t"; print "candidate","position","reference","alternate","quality","total_depth","allele_depths" } { print }' \
+            awk 'BEGIN { OFS="\t"; print "contig","position","reference","alternate","quality","total_depth","allele_depths" } { print }' \
             > "$OUTDIR/final/residual_variants.tsv"
     fi
 }
@@ -2319,7 +2278,32 @@ def resolved(value):
 
 layout = {r['contig']: r for r in rows(root / 'contig_validation.tsv')}
 itsx = {r['contig']: r for r in rows(root / 'itsx_validation.tsv')}
-catalog = {r['candidate']: r for r in rows(root / 'locus_catalog.tsv')}
+catalog = {r['contig']: r for r in rows(root / 'locus_catalog.tsv')}
+
+def best_anchor_coordinates(path):
+    """Return the best query-coordinate interval for each native contig."""
+    result = {}
+    if not path.exists() or path.stat().st_size == 0:
+        return result
+    with path.open() as handle:
+        for line in handle:
+            fields = line.rstrip('\n').split('\t')
+            if len(fields) < 13:
+                continue
+            try:
+                start, end = int(fields[2]), int(fields[3])
+                bitscore = float(fields[12])
+            except ValueError:
+                continue
+            query = fields[0]
+            if query not in result or bitscore > result[query][0]:
+                result[query] = (bitscore, f'{min(start, end)}-{max(start, end)}')
+    return {query: value[1] for query, value in result.items()}
+
+ssu_anchor_coordinates = best_anchor_coordinates(
+    root.parent / 'validation' / 'contigs_vs_18S.tsv')
+lsu_anchor_coordinates = best_anchor_coordinates(
+    root.parent / 'validation' / 'contigs_vs_28S.tsv')
 coverage = {}
 for r in rows(root / 'readback_coverage.tsv'):
     key = r.get('#rname') or r.get('rname')
@@ -2444,8 +2428,7 @@ detailed_fields = ['contig','contig_length','locus_type','source','orientation',
           'ITS2_coordinates','ITS2_bp','LSU_coordinates','LSU_bp',
           '18S_anchor_identity','28S_anchor_identity','readback_coverage_percent','readback_mean_depth',
           'readback_mean_mapq','unique_mapped_reads','unique_coverage_percent',
-          'unique_mean_depth','graph_junctions','junctions_with_read_support',
-          'minimum_junction_spanning_reads','taxonomy_status','expected_taxonomy',
+          'unique_mean_depth','taxonomy_status','expected_taxonomy',
           *[f'consensus_{rank}' for rank in ranks],
           'consensus_taxonomy','SSU_consensus_taxonomy','ITS_consensus_taxonomy',
           'LSU_consensus_taxonomy','SSU_near_top_hits','ITS_near_top_hits',
@@ -2462,7 +2445,7 @@ for marker in ('SSU','ITS','LSU'):
 with (root / 'rrna_locus_summary.tsv').open('w', newline='') as handle:
     out = csv.DictWriter(handle, fieldnames=detailed_fields, delimiter='\t', lineterminator='\n')
     out.writeheader()
-    support = {r['candidate']: r for r in rows(root / 'path_support.tsv')}
+    support = {r['contig']: r for r in rows(root / 'contig_support.tsv')}
     for contig in sorted(catalog):
         x, l, c = itsx.get(contig, {}), layout.get(contig, {}), coverage.get(contig, {})
         candidate, p = catalog[contig], support.get(contig, {})
@@ -2478,10 +2461,7 @@ with (root / 'rrna_locus_summary.tsv').open('w', newline='') as handle:
                'readback_mean_mapq':c.get('meanmapq','NA'),
                'unique_mapped_reads':p.get('unique_mapped_reads','NA'),
                'unique_coverage_percent':p.get('unique_coverage_percent','NA'),
-               'unique_mean_depth':p.get('unique_mean_depth','NA'),
-               'graph_junctions':p.get('graph_junctions','NA'),
-               'junctions_with_read_support':p.get('junctions_with_read_support','NA'),
-               'minimum_junction_spanning_reads':p.get('minimum_junction_spanning_reads','NA')}
+               'unique_mean_depth':p.get('unique_mean_depth','NA')}
         for marker in ('SSU','ITS1','5.8S','ITS2','LSU'):
             row[f'{marker}_coordinates'] = x.get(marker, 'NA')
             row[f'{marker}_bp'] = region_length(x.get(marker, ''))
@@ -2498,48 +2478,39 @@ with (root / 'rrna_locus_summary.tsv').open('w', newline='') as handle:
                 row[f'{marker}_top_{suffix}'] = hit(contig, marker, source)
         out.writerow(row)
 
-# Keep the master summaries intentionally concise. The complete audit table
-# remains available as rrna_locus_summary.tsv.
-master_fields = ['contig','locus_type','length_bp','regions','mean_depth','taxonomy_status',
-                 'consensus_taxonomy','expected_taxonomy',
-                 'SSU_top_hit','SSU_identity','SSU_aligned_bp',
-                 'ITS_top_hit','ITS_identity','ITS_aligned_bp',
-                 'LSU_top_hit','LSU_identity','LSU_aligned_bp']
+# Keep the master summaries intentionally concise and contig-only. Coordinates
+# come from ITSx for complete loci and from anchor alignments for partial SSU or
+# LSU contigs. The complete audit table remains rrna_locus_summary.tsv.
+master_fields = ['contig','locus_type','length_bp','SSU_coordinates',
+                 'ITS1_coordinates','5.8S_coordinates','ITS2_coordinates',
+                 'LSU_coordinates','mean_depth','taxonomy_status',
+                 'consensus_taxonomy']
 master_rows = []
 for contig in sorted(catalog):
     x, c, tax = itsx.get(contig, {}), coverage.get(contig, {}), taxonomy[contig]
     candidate = catalog[contig]
-    if x:
-        regions = '; '.join(f'{marker}={x.get(marker, "NA")}'
-                            for marker in ('SSU','ITS1','5.8S','ITS2','LSU'))
-    elif candidate.get('locus_type') == 'PARTIAL_18S':
-        regions = 'SSU=partial'
-    elif candidate.get('locus_type') == 'PARTIAL_28S':
-        regions = 'LSU=partial'
-    elif candidate.get('locus_type') == 'AMBIGUOUS_DUAL_ANCHOR':
-        regions = 'SSU=present; LSU=present; layout=ambiguous'
-    else:
-        regions = 'rRNA=seed_anchored'
+    coordinates = {
+        'SSU': x.get('SSU', ssu_anchor_coordinates.get(contig, 'NA')),
+        'ITS1': x.get('ITS1', 'NA'),
+        '5.8S': x.get('5.8S', 'NA'),
+        'ITS2': x.get('ITS2', 'NA'),
+        'LSU': x.get('LSU', lsu_anchor_coordinates.get(contig, 'NA')),
+    }
     header_depth = 'NA'
     match = re.search(r'_cov_([0-9.]+)', contig)
     if match:
         header_depth = match.group(1)
     master_rows.append({
         'contig': contig, 'locus_type':candidate.get('locus_type','NA'),
-        'length_bp': candidate.get('length_bp',x.get('length','NA')), 'regions': regions,
+        'length_bp': candidate.get('length_bp',x.get('length','NA')),
+        'SSU_coordinates': coordinates['SSU'],
+        'ITS1_coordinates': coordinates['ITS1'],
+        '5.8S_coordinates': coordinates['5.8S'],
+        'ITS2_coordinates': coordinates['ITS2'],
+        'LSU_coordinates': coordinates['LSU'],
         'mean_depth': c.get('meandepth',header_depth),
         'taxonomy_status': tax['taxonomy_status'],
-        'consensus_taxonomy': tax['consensus_taxonomy'],
-        'expected_taxonomy': tax['expected_taxonomy'],
-        'SSU_top_hit': hit(contig,'SSU','scientific_names'),
-        'SSU_identity': hit(contig,'SSU','percent_identity'),
-        'SSU_aligned_bp': hit(contig,'SSU','aligned_bp'),
-        'ITS_top_hit': hit(contig,'ITS','scientific_names'),
-        'ITS_identity': hit(contig,'ITS','percent_identity'),
-        'ITS_aligned_bp': hit(contig,'ITS','aligned_bp'),
-        'LSU_top_hit': hit(contig,'LSU','scientific_names'),
-        'LSU_identity': hit(contig,'LSU','percent_identity'),
-        'LSU_aligned_bp': hit(contig,'LSU','aligned_bp')
+        'consensus_taxonomy': tax['consensus_taxonomy']
     })
 
 with (root / 'master_summary.tsv').open('w', newline='') as destination:
@@ -2928,10 +2899,12 @@ extract_fasta_by_names "$OUTDIR/final/rrna_candidate_contig_names.txt" \
 : > "$DUAL_CONTIGS"
 DUAL_COUNT=0
 if (( ${#LEFT_DATABASES[@]} > 0 && ${#RIGHT_DATABASES[@]} > 0 )); then
-    log "Variant-aware graph analysis: enumerating bounded paths between compatible anchors."
+    if [[ "$GRAPH_PATHS" == true ]]; then
+        log "Diagnostic graph analysis: enumerating bounded paths; inferred paths will not enter contig reports."
+    fi
     enumerate_graph_paths
-    merge_locus_candidates
-    ALL_LOCUS_CANDIDATES="$OUTDIR/final/all_locus_candidates.fasta"
+    prepare_native_contig_candidates
+    ALL_LOCUS_CANDIDATES="$OUTDIR/validation/native_contig_candidates.fasta"
 
     contig_anchor_hits "$ALL_LOCUS_CANDIDATES" "$LEFT_INDEX" \
         "$OUTDIR/final/left_anchor_hits.tsv" "$OUTDIR/final/left_anchor.log"
@@ -2970,9 +2943,10 @@ else
     AMBIGUOUS_COUNT=0
     : > "$OUTDIR/final/oriented_dual_anchor_contigs.fasta"
     : > "$OUTDIR/final/ambiguous_dual_anchor_contigs.fasta"
-    : > "$OUTDIR/final/graph_candidate_paths.fasta"
-    : > "$OUTDIR/final/graph_path_summary.tsv"
-    cp -- "$CANDIDATE_CONTIGS" "$OUTDIR/final/all_locus_candidates.fasta"
+    mkdir -p "$OUTDIR/validation/graph_paths"
+    : > "$OUTDIR/validation/graph_paths/graph_candidate_paths.fasta"
+    : > "$OUTDIR/validation/graph_paths/graph_path_summary.tsv"
+    cp -- "$CANDIDATE_CONTIGS" "$OUTDIR/validation/native_contig_candidates.fasta"
     : > "$OUTDIR/final/partial_18S_contigs.fasta"
     : > "$OUTDIR/final/partial_28S_contigs.fasta"
     : > "$OUTDIR/final/partial_locus_contigs.fasta"
@@ -2985,7 +2959,7 @@ else
     : > "$OUTDIR/final/5_8S.fasta"
     : > "$OUTDIR/final/ITS2.fasta"
     : > "$OUTDIR/final/readback_coverage.tsv"
-    : > "$OUTDIR/final/path_support.tsv"
+    : > "$OUTDIR/final/contig_support.tsv"
     : > "$OUTDIR/final/residual_variants.tsv"
     : > "$OUTDIR/final/ncbi_SSU_hits.tsv"
     : > "$OUTDIR/final/ncbi_ITS_hits.tsv"
@@ -3006,7 +2980,13 @@ done
 read -r ALL_CONTIG_COUNT ALL_BP < <(fasta_stats "$ALL_CONTIGS")
 read -r CANDIDATE_COUNT CANDIDATE_BP < <(fasta_stats "$CANDIDATE_CONTIGS")
 read -r COMPLETE_ITS_COUNT COMPLETE_ITS_BP < <(fasta_stats "$OUTDIR/final/complete_ITS.fasta")
-read -r GRAPH_PATH_COUNT GRAPH_PATH_BP < <(fasta_stats "$OUTDIR/final/graph_candidate_paths.fasta")
+if [[ -s "$OUTDIR/validation/graph_paths/graph_candidate_paths.fasta" ]]; then
+    read -r GRAPH_PATH_COUNT GRAPH_PATH_BP < <(
+        fasta_stats "$OUTDIR/validation/graph_paths/graph_candidate_paths.fasta")
+else
+    GRAPH_PATH_COUNT=0
+    GRAPH_PATH_BP=0
+fi
 read -r PARTIAL_LOCUS_COUNT PARTIAL_LOCUS_BP < <(fasta_stats "$OUTDIR/final/partial_locus_contigs.fasta")
 VARIANT_COUNT=$(awk 'END { print (NR > 0 ? NR - 1 : 0) }' "$OUTDIR/final/residual_variants.tsv")
 EXPECTED_PASS_COUNT=$(awk -F '\t' 'NR > 1 && ($3 == "PASS_expected_taxon" || $3 == "PARTIAL_expected_taxon") { n++ } END { print n + 0 }' \
@@ -3057,8 +3037,8 @@ printf '%s\n' \
     "All assembled bp: $ALL_BP" \
     "Seed-anchored candidate contigs: $CANDIDATE_COUNT" \
     "Seed-anchored candidate bp: $CANDIDATE_BP" \
-    "Graph-derived candidate paths: $GRAPH_PATH_COUNT" \
-    "Graph-derived candidate-path bp: $GRAPH_PATH_BP" \
+    "Diagnostic graph paths (excluded from reports): $GRAPH_PATH_COUNT" \
+    "Diagnostic graph-path bp: $GRAPH_PATH_BP" \
     "Dual-anchor contigs: $DUAL_COUNT" \
     "Validated and oriented dual-anchor contigs: $ORIENTED_COUNT" \
     "Ambiguous dual-anchor contigs: $AMBIGUOUS_COUNT" \
@@ -3084,13 +3064,14 @@ if [[ "$KEEP_BAM" != true ]]; then
 fi
 
 log "Finished. Candidate contigs: $CANDIDATE_CONTIGS"
-log "Graph-derived candidate paths: $OUTDIR/final/graph_candidate_paths.fasta"
-log "All complete and partial locus candidates: $OUTDIR/final/all_locus_candidates.fasta"
+if [[ "$GRAPH_PATHS" == true ]]; then
+    log "Diagnostic graph paths: $OUTDIR/validation/graph_paths/graph_candidate_paths.fasta"
+fi
 log "Dual-anchor contigs: $DUAL_CONTIGS"
 log "Oriented validated contigs: $OUTDIR/final/oriented_dual_anchor_contigs.fasta"
 log "Complete ITS regions: $OUTDIR/final/complete_ITS.fasta"
 log "Validation report: $OUTDIR/final/contig_validation.tsv"
-log "Path support: $OUTDIR/final/path_support.tsv"
+log "Contig support: $OUTDIR/final/contig_support.tsv"
 log "Residual unphased variants: $OUTDIR/final/residual_variants.tsv"
 log "NCBI top hits: $OUTDIR/final/ncbi_blast_top_hits.tsv"
 log "Taxonomy validation: $OUTDIR/final/taxonomy_validation.tsv"

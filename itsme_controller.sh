@@ -7,7 +7,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="1.4.1"
+VERSION="1.5.0"
 INPUT_DIR=""
 OUTPUT_DIR=""
 ITSME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/itsme.sh"
@@ -18,7 +18,7 @@ ITSME_ARGS=()
 
 usage() {
     cat <<'EOF'
-ITSME controller v1.4.1
+ITSME controller v1.5.0
 
 Run itsme.sh sequentially for every paired FASTQ library in a directory.
 
