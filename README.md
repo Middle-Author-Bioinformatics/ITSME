@@ -2,42 +2,43 @@
 
 **Iterative Targeted Sequence Mining and Extension**
 
-ITSME is a targeted short-read assembly pipeline for recovering eukaryotic nuclear rDNA loci:
-
 ```text
-18S (SSU) ──→ ITS1 ──→ 5.8S ──→ ITS2 ──→ 28S (LSU)
+18S (SSU) ── ITS1 ── 5.8S ── ITS2 ── 28S (LSU)
 ```
 
-It maps genomic reads to 18S and 28S seed databases, recruits their mates, performs guarded inward extension across the ITS region, quality-filters the recruited subset, and assembles it with SPAdes. Final contigs are oriented and annotated with ITSx, validated by competitive read mapping, and classified against local NCBI SSU, ITS, and LSU databases.
+ITSME recovers eukaryotic nuclear rDNA loci from paired short reads, including
+mixed environmental samples. It maps raw reads to 18S and 28S seeds, performs
+graph-aware inward recruitment and one conservative outward pass, quality
+filters only recruited reads, and assembles the enriched pool with metaSPAdes.
 
 ```mermaid
 flowchart LR
-    A[Raw paired reads] --> B[18S and 28S seed mapping]
-    B --> C[Guarded inward recruitment]
-    C --> D[Post-map QC]
-    D --> E[SPAdes assembly]
-    E --> F[ITSx, read-back, and taxonomy]
+    A[Raw reads] --> B[18S and 28S baiting]
+    B --> C[Guarded extension]
+    C --> D[metaSPAdes graph]
+    D --> E[Validated rDNA loci]
 ```
 
-By default, ITSME performs one conservative extension round from the inward-facing ends of 18S and 28S. Use `-R 0` to disable extension or `--outward` to recruit from the complete seed-hit frontier. Excessive recruitment growth is rejected before assembly.
+Native SPAdes `NODE_...` contigs are always retained. ITSME also enumerates
+bounded paths through the assembly graph, but promotes a path as an
+`ITSME_LOCUS_...` only when it has the expected SSU–ITS1–5.8S–ITS2–LSU
+structure, every graph junction has read-template support, and independent SSU
+and LSU classifications agree at least at phylum. ITS classification is
+secondary evidence: agreement strengthens a result, absence does not reject it,
+and conflict is reported as a warning. All unpromoted paths remain available in
+`validation/graph_paths/` for audit.
 
-## Requirements
-
-ITSME uses Bash, Bowtie2, Samtools, SPAdes, BLAST+, Python 3, Trimmomatic, FLASH2, ITSx, and BBMap/BBDuk.
-
-Create and activate the software environment:
+## Install
 
 ```bash
-mamba create -n itsme \
-    -c conda-forge \
-    -c bioconda \
-    bowtie2 samtools spades blast itsx bbmap trimmomatic flash2 pigz seqkit \
-    --yes
-
+mamba create -n itsme -c conda-forge -c bioconda \
+    bowtie2 samtools bcftools spades blast itsx bbmap \
+    trimmomatic flash2 pigz seqkit --yes
 mamba activate itsme
+chmod +x itsme.sh itsme_controller.sh setup_db.sh
 ```
 
-Supply one database root with `--db-dir`. It should contain:
+The database directory supplied with `--db-dir` must contain:
 
 ```text
 itsme_db/
@@ -54,56 +55,51 @@ itsme_db/
     └── merged.dmp
 ```
 
-Create this directory automatically in the current directory:
-
-```bash
-chmod +x setup_db.sh
-./setup_db.sh
-```
-
-Or choose a location:
-
-```bash
-./setup_db.sh --db-dir /home/ark/databases/itsme_db
-```
+Create or populate it with `./setup_db.sh`, optionally using
+`--db-dir /path/to/itsme_db`.
 
 ## Quick start
 
-```bash
-chmod +x itsme.sh itsme_controller.sh setup_db.sh
-```
-
-Run one paired library:
+Run one library with the balanced sensitivity preset:
 
 ```bash
 ./itsme.sh \
     -1 sample_R1_001.fastq.gz \
     -2 sample_R2_001.fastq.gz \
+    -o itsme_sample \
     --db-dir /home/ark/databases/itsme_db \
-    -o itsme_sample
+    --expected-taxonomy Echinodermata \
+    --sensitivity 2
 ```
 
-Run every paired library in a directory:
+`--sensitivity` accepts `1` (specific), `2` (balanced; default), or `3`
+(sensitive). `--expected-taxonomy` labels results but never removes non-target
+sequences.
+
+Run all paired libraries in a directory:
 
 ```bash
 ./itsme_controller.sh \
     -i /path/to/fastqs \
-    -o /path/to/itsme_results \
-    --db-dir /home/ark/databases/itsme_db
+    -o /path/to/results \
+    --db-dir /home/ark/databases/itsme_db \
+    --expected-taxonomy Echinodermata \
+    --sensitivity 2 \
+    --resume
 ```
 
-The controller pairs `_R1` and `_R2` files, creates one result directory per library, and writes `batch_status.tsv` and `batch_master_summary.csv`. ITSME options such as `--db-dir`, `-t`, `-m`, and `-R` can be provided directly to the controller and are passed to every library run.
+No `--` separator is required before ITSME options.
 
-Resume a batch with `--resume`:
+## Key outputs
 
-```bash
-./itsme_controller.sh \
-    -i /path/to/fastqs \
-    -o /path/to/itsme_results \
-    --resume \
-    --db-dir /home/ark/databases/itsme_db
-```
+| File | Contents |
+| --- | --- |
+| `master_summary.csv` | Concise native-contig and promoted-locus summary with region coordinates and consensus taxonomy |
+| `final/complete_rDNA_loci.fasta` | Complete validated native and reconstructed rDNA loci |
+| `final/reconstructed_graph_loci.fasta` | Graph paths promoted after structural, junction-support, and taxonomy checks |
+| `final/graph_locus_validation.tsv` | Decision and reason for every bounded graph path |
+| `final/partial_locus_contigs.fasta` | Native partial 18S/28S contigs retained from the assembly |
+| `validation/graph_paths/graph_candidate_paths.fasta` | Every bounded path before promotion filtering |
+| `run_summary.txt` | Run settings, counts, stopping reason, and elapsed time |
 
-Primary results include `master_summary.csv`, `final/oriented_dual_anchor_contigs.fasta`, `final/complete_ITS.fasta`, and the separate ITS-region FASTA files.
-
-Run `./itsme.sh --help` or `./itsme_controller.sh --help` for all options.
+Use `./itsme.sh --help` and `./itsme_controller.sh --help` for all options.

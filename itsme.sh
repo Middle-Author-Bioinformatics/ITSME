@@ -9,18 +9,19 @@
 #   4. Extend inward and conservatively outward with frontier-only exact k-mers.
 #   5. Reject abnormal recruitment before it can enter the assembly.
 #   6. Assemble the final accepted pool once with SPAdes.
-#   7. Use the graph to monitor complexity and optionally enumerate diagnostics.
-#   8. Report only native final SPAdes contigs, their regions, and read support.
+#   7. Enumerate bounded 18S-to-28S graph paths and measure junction support.
+#   8. Promote only structurally valid, read-supported, taxonomically coherent paths.
+#   9. Retain native SPAdes contigs and every candidate path as audit evidence.
 #
 # This is not GetOrganelle. Short reads cannot prove long-range phase across
-# every rDNA repeat variant, so inferred graph paths are never mixed with the
-# reportable native SPAdes contigs.
+# every rDNA repeat variant. Graph-derived loci are therefore promoted only
+# after independent SSU/LSU classification and support at every graph junction.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 SECONDS=0
 
-VERSION="1.5.1"
+VERSION="1.6.0"
 
 READS_1=""
 READS_2=""
@@ -81,11 +82,13 @@ TAXDUMP_DIR="${NCBI_TAXDUMP_DIR:-}"
 TAXDUMP_DIR_EXPLICIT=false
 EXPECTED_TAXONOMY=""
 TAXONOMY_NEAR_TOP_FRACTION=0.95
-GRAPH_PATHS=false
+GRAPH_PATHS=true
 MAX_GRAPH_PATHS=500
 MAX_GRAPH_NODES=40
 MAX_GRAPH_BP=25000
 MIN_GRAPH_DEPTH=1.0
+MIN_JUNCTION_READS=3
+JUNCTION_FLANK=10
 ADAPTIVE_GRAPH_STOP=true
 GRAPH_CHECK_K=31
 GRAPH_STOP_BRANCHES=2
@@ -107,7 +110,7 @@ ASSEMBLY_SINGLE_FILES=()
 
 usage() {
     cat <<'EOF'
-ITSME v1.5.1 - contig-focused eukaryotic rDNA recruitment and classification
+ITSME v1.6.0 - graph-aware eukaryotic rDNA recruitment and classification
 
 Usage:
   itsme.sh -1 R1.fastq.gz -2 R2.fastq.gz \
@@ -192,13 +195,17 @@ Assembly and output:
       --anchor-min-aligned INT     Minimum seed alignment on a contig [150]
       --anchor-min-identity FLOAT  Minimum contig seed-hit identity [0.85]
       --layout-overlap INT         Maximum allowed 18S/28S overlap [25]
-      --enumerate-graph-paths      Write inferred GFA paths as diagnostics;
-                                   never include them in contig reports [off]
-      --skip-graph-paths           Disable diagnostic GFA path enumeration
-      --max-graph-paths INT        Maximum diagnostic graph paths [500]
+      --enumerate-graph-paths      Enumerate and validate bounded GFA paths
+                                   [enabled by default]
+      --skip-graph-paths           Disable graph-path reconstruction
+      --max-graph-paths INT        Maximum bounded graph paths [500]
       --max-graph-nodes INT        Maximum segments in one graph path [40]
       --max-graph-bp INT           Maximum candidate path length [25000]
       --min-graph-depth FLOAT      Minimum segment k-mer depth in a path [1.0]
+      --min-junction-reads INT     Minimum read templates spanning every path
+                                   junction before promotion [3]
+      --junction-flank INT         Required aligned bases on each side of a
+                                   graph junction [10]
       --skip-adaptive-graph-stop   Skip fast graph checks between inward rounds
       --graph-check-k INT          Single k-mer used by checkpoint SPAdes [31]
       --graph-stop-branches INT    Stop at this many branch nodes in a connected
@@ -231,6 +238,10 @@ Assembly and output:
 
 Principal outputs:
   OUTPUT/final/rrna_candidate_contigs.fasta
+  OUTPUT/final/reconstructed_graph_loci.fasta
+  OUTPUT/final/complete_rDNA_loci.fasta
+  OUTPUT/final/graph_locus_validation.tsv
+  OUTPUT/final/locus_source_map.tsv
   OUTPUT/final/partial_18S_contigs.fasta
   OUTPUT/final/partial_28S_contigs.fasta
   OUTPUT/final/rrna_dual_anchor_contigs.fasta
@@ -282,14 +293,17 @@ Notes:
   * Recruitment is bounded by both a library fraction and an absolute template
     ceiling. Checkpoint SPAdes uses one k-mer; the full multi-k SPAdes assembly
     is run once after recruitment stops.
-  * Final biological reports contain only native NODE_ contigs emitted by the
-    post-extension SPAdes assembly. Optional --enumerate-graph-paths output is
-    diagnostic and remains under validation/; it is never merged into reports.
+  * All bounded 18S-to-28S graph paths are retained under validation/graph_paths/.
+    A path is promoted to a reconstructed locus only when every graph junction
+    has sufficient read-template support and SSU and LSU agree at phylum or
+    deeper. Native NODE_ contigs remain the underlying assembly evidence.
   * Dual-anchor contigs are validated for non-overlapping, consistently
     oriented 18S and 28S anchors and automatically oriented 18S-to-28S.
   * ITSx runs only on oriented contigs, avoiding reverse-orientation artifacts.
   * NCBI classification uses the local SSU_eukaryote_rRNA,
-    ITS_eukaryote_sequences and LSU_eukaryote_rRNA databases.
+    ITS_eukaryote_sequences and LSU_eukaryote_rRNA databases. SSU and LSU
+    determine the primary whole-locus taxonomy; ITS is independent secondary
+    evidence and does not reject an otherwise coherent path when unresolved.
   * Complete and partial native contigs are retained regardless of taxon.
     Residual VCF records remain unphased.
 EOF
@@ -371,6 +385,7 @@ apply_sensitivity_preset() {
             MIN_GRAPH_DEPTH=2.0
             MAX_GRAPH_PATHS=250
             MAX_GRAPH_NODES=30
+            MIN_JUNCTION_READS=5
             GRAPH_STOP_NODES=300
             ;;
         2|balanced)
@@ -393,6 +408,7 @@ apply_sensitivity_preset() {
             MIN_GRAPH_DEPTH=1.0
             MAX_GRAPH_PATHS=500
             MAX_GRAPH_NODES=40
+            MIN_JUNCTION_READS=3
             GRAPH_STOP_NODES=500
             ;;
         3|sensitive)
@@ -415,6 +431,7 @@ apply_sensitivity_preset() {
             MIN_GRAPH_DEPTH=0.5
             MAX_GRAPH_PATHS=1000
             MAX_GRAPH_NODES=60
+            MIN_JUNCTION_READS=2
             GRAPH_STOP_NODES=500
             ;;
         *)
@@ -554,6 +571,10 @@ while [[ $# -gt 0 ]]; do
             need_value "$@"; MAX_GRAPH_BP="$2"; shift 2 ;;
         --min-graph-depth)
             need_value "$@"; MIN_GRAPH_DEPTH="$2"; shift 2 ;;
+        --min-junction-reads)
+            need_value "$@"; MIN_JUNCTION_READS="$2"; shift 2 ;;
+        --junction-flank)
+            need_value "$@"; JUNCTION_FLANK="$2"; shift 2 ;;
         --skip-adaptive-graph-stop)
             ADAPTIVE_GRAPH_STOP=false; shift ;;
         --graph-check-k)
@@ -716,6 +737,8 @@ is_nonnegative_int "$GRAPH_STOP_CYCLES" || die "--graph-stop-cycles must be nonn
 is_positive_int "$GRAPH_STOP_NODES" || die "--graph-stop-nodes must be positive."
 is_number "$MIN_GRAPH_DEPTH" || die "--min-graph-depth must be nonnegative."
 greater_than 0 "$MIN_GRAPH_DEPTH" && die "--min-graph-depth must be nonnegative."
+is_nonnegative_int "$MIN_JUNCTION_READS" || die "--min-junction-reads must be nonnegative."
+is_positive_int "$JUNCTION_FLANK" || die "--junction-flank must be positive."
 is_nonnegative_int "$VARIANT_MIN_MAPQ" || die "--variant-min-mapq must be nonnegative."
 is_nonnegative_int "$VARIANT_MIN_BASEQ" || die "--variant-min-baseq must be nonnegative."
 is_positive_int "$VARIANT_MAX_DEPTH" || die "--variant-max-depth must be positive."
@@ -1883,15 +1906,18 @@ PY
     fi
 }
 
-prepare_native_contig_candidates() {
+prepare_locus_candidate_set() {
     local contigs="$OUTDIR/final/rrna_candidate_contigs.fasta"
-    local output="$OUTDIR/validation/native_contig_candidates.fasta"
-    local provenance="$OUTDIR/validation/native_contig_provenance.tsv"
-    python3 - "$contigs" "$output" "$provenance" <<'PY'
+    local graph_paths="$OUTDIR/validation/graph_paths/graph_candidate_paths.fasta"
+    local output="$OUTDIR/validation/analysis_locus_candidates.fasta"
+    local provenance="$OUTDIR/validation/locus_candidate_provenance.tsv"
+    local duplicates="$OUTDIR/validation/graph_paths/duplicate_native_paths.tsv"
+    python3 - "$contigs" "$graph_paths" "$output" "$provenance" "$duplicates" <<'PY'
+import hashlib
 import sys
 from pathlib import Path
 
-contigs, output, provenance = map(Path, sys.argv[1:])
+contigs, graph_paths, output, provenance, duplicates = map(Path, sys.argv[1:])
 
 def records(path):
     if not path.exists():
@@ -1911,23 +1937,42 @@ def records(path):
         if name is not None:
             yield name, description, ''.join(sequence).upper()
 
-with output.open('w') as fasta, provenance.open('w') as table:
+comp = str.maketrans('ACGTRYMKBDHVN', 'TGCAYRKMVHDBN')
+def canonical(sequence):
+    reverse = sequence.translate(comp)[::-1]
+    return hashlib.sha256(min(sequence, reverse).encode()).hexdigest()
+
+native_sequences = {}
+with output.open('w') as fasta, provenance.open('w') as table, \
+        duplicates.open('w') as duplicate_table:
     table.write('contig\tsource\tsource_header\tlength_bp\n')
+    duplicate_table.write('path_id\tduplicate_native_contig\tlength_bp\treason\n')
     for name, description, sequence in records(contigs):
+        native_sequences.setdefault(canonical(sequence), name)
         fasta.write(f'>{description}\n')
         for start in range(0, len(sequence), 80):
             fasta.write(sequence[start:start + 80] + '\n')
         table.write(f'{name}\tspades_contig\t{description}\t{len(sequence)}\n')
+    for name, description, sequence in records(graph_paths):
+        duplicate = native_sequences.get(canonical(sequence))
+        if duplicate:
+            duplicate_table.write(
+                f'{name}\t{duplicate}\t{len(sequence)}\texact_sequence_duplicate\n')
+            continue
+        fasta.write(f'>{description}\n')
+        for start in range(0, len(sequence), 80):
+            fasta.write(sequence[start:start + 80] + '\n')
+        table.write(f'{name}\tgraph_path\t{description}\t{len(sequence)}\n')
 PY
 }
 
 catalog_locus_candidates() {
-    local candidates="$OUTDIR/validation/native_contig_candidates.fasta"
+    local candidates="$OUTDIR/validation/analysis_locus_candidates.fasta"
     local left_names="$OUTDIR/final/left_anchor_contig_names.txt"
     local right_names="$OUTDIR/final/right_anchor_contig_names.txt"
     python3 - "$candidates" "$left_names" "$right_names" \
         "$OUTDIR/final/contig_validation.tsv" \
-        "$OUTDIR/validation/native_contig_provenance.tsv" "$OUTDIR/final" <<'PY'
+        "$OUTDIR/validation/locus_candidate_provenance.tsv" "$OUTDIR/final" <<'PY'
 import csv, sys
 from pathlib import Path
 
@@ -1989,7 +2034,9 @@ for name in sorted(records):
     else:
         locus_type = 'SEED_ANCHORED_OTHER'
     catalog.write(f'{name}\t{len(sequence)}\t{locus_type}\t{provenance.get(name, "NA")}\t{layout}\n')
-    if locus_type in outputs:
+    # Native SPAdes fragments are biological outputs. Unpromoted graph paths
+    # remain in validation/ and must not leak into the partial-contig FASTAs.
+    if provenance.get(name) == 'spades_contig' and locus_type in outputs:
         outputs[locus_type].write(f'>{description} locus_type={locus_type}\n')
         for start in range(0, len(sequence), 80):
             outputs[locus_type].write(sequence[start:start + 80] + '\n')
@@ -2055,11 +2102,14 @@ PY
 run_competitive_readback() {
     local targets="$OUTDIR/final/oriented_dual_anchor_contigs.fasta"
     local readback_dir="$OUTDIR/validation/readback"
+    local junction_support="$OUTDIR/validation/graph_paths/junction_support.tsv"
     : > "$OUTDIR/final/readback_coverage.tsv"
     printf 'contig\tlength_bp\tall_mapped_reads\tcoverage_percent\tmean_depth\tmean_mapq\tunique_mapped_reads\tunique_coverage_percent\tunique_mean_depth\n' \
         > "$OUTDIR/final/contig_support.tsv"
     printf 'contig\tposition\treference\talternate\tquality\ttotal_depth\tallele_depths\n' \
         > "$OUTDIR/final/residual_variants.tsv"
+    printf 'path_id\tjunction_count\tsupported_junctions\tminimum_junction_spanning_templates\tjunction_template_counts\n' \
+        > "$junction_support"
     [[ "$READBACK" == true && -s "$targets" ]] || return 0
     mkdir -p "$readback_dir"
     bowtie2-build --threads "$THREADS" "$targets" "$readback_dir/candidates" \
@@ -2075,6 +2125,114 @@ run_competitive_readback() {
         > "$OUTDIR/final/readback_coverage.tsv"
     samtools flagstat "$readback_dir/candidates.bam" \
         > "$OUTDIR/final/readback_flagstat.txt"
+
+    # Count exact junction-spanning templates in the bounded recruited pool.
+    # This is deliberately noncompetitive: a read that supports a shared graph
+    # edge supports every compatible path, rather than being assigned at random
+    # to one nearly identical Bowtie2 target.
+    python3 - "$OUTDIR/validation/graph_paths/graph_path_summary.tsv" \
+        "$OUTDIR/final/contig_validation.tsv" "$targets" "$junction_support" \
+        "$JUNCTION_FLANK" "$FINAL_R1" "$FINAL_R2" "$FINAL_SINGLE" <<'PY'
+import csv
+import gzip
+import re
+import sys
+from collections import defaultdict
+
+summary_path, layout_path, fasta_path, output_path, flank, *fastq_paths = sys.argv[1:]
+flank = int(flank)
+
+layout = {}
+with open(layout_path) as handle:
+    for row in csv.DictReader(handle, delimiter='\t'):
+        layout[row['contig']] = row
+
+paths = {}
+with open(summary_path) as handle:
+    for row in csv.DictReader(handle, delimiter='\t'):
+        text = row.get('junction_positions', 'NA')
+        junctions = [] if text in {'', 'NA'} else [int(value) for value in text.split(',')]
+        orientation = layout.get(row['path_id'], {}).get('orientation', 'forward')
+        if orientation == 'reverse_complemented':
+            length = int(row['length_bp'])
+            junctions = sorted(length - value for value in junctions)
+        paths[row['path_id']] = junctions
+
+sequences, name, parts = {}, None, []
+with open(fasta_path) as handle:
+    for line in handle:
+        line = line.strip()
+        if line.startswith('>'):
+            if name is not None:
+                sequences[name] = ''.join(parts).upper()
+            name, parts = line[1:].split()[0], []
+        elif name is not None:
+            parts.append(line)
+    if name is not None:
+        sequences[name] = ''.join(parts).upper()
+
+complement = str.maketrans('ACGT', 'TGCA')
+word_targets = defaultdict(set)
+support = {path_id: {position: set() for position in junctions}
+           for path_id, junctions in paths.items()}
+word_length = flank * 2
+for path_id, junctions in paths.items():
+    sequence = sequences.get(path_id, '')
+    for junction in junctions:
+        start, end = junction - flank, junction + flank
+        if start < 0 or end > len(sequence):
+            continue
+        word = sequence[start:end]
+        if len(word) != word_length or re.search('[^ACGT]', word):
+            continue
+        target = (path_id, junction)
+        word_targets[word].add(target)
+        word_targets[word.translate(complement)[::-1]].add(target)
+
+def fastq_records(path):
+    opener = gzip.open if path.endswith(('.gz', '.bgz')) else open
+    with opener(path, 'rt') as handle:
+        while True:
+            header = handle.readline()
+            if not header:
+                return
+            sequence = handle.readline()
+            plus = handle.readline()
+            quality = handle.readline()
+            if not sequence or not plus or not quality:
+                raise SystemExit(f'malformed FASTQ while checking junctions: {path}')
+            name = header[1:].split()[0]
+            if name.endswith(('/1', '/2')):
+                name = name[:-2]
+            yield name, sequence.strip().upper()
+
+for path in fastq_paths:
+    for template, sequence in fastq_records(path):
+        if len(sequence) < word_length:
+            continue
+        observed = set()
+        for start in range(len(sequence) - word_length + 1):
+            targets = word_targets.get(sequence[start:start + word_length])
+            if targets:
+                observed.update(targets)
+        for path_id, junction in observed:
+            support[path_id][junction].add(template)
+
+with open(output_path, 'w', newline='') as handle:
+    fields = ['path_id', 'junction_count', 'supported_junctions',
+              'minimum_junction_spanning_templates', 'junction_template_counts']
+    writer = csv.DictWriter(handle, fieldnames=fields, delimiter='\t', lineterminator='\n')
+    writer.writeheader()
+    for path_id in sorted(paths):
+        counts = [len(support[path_id][position]) for position in paths[path_id]]
+        writer.writerow({
+            'path_id': path_id,
+            'junction_count': len(counts),
+            'supported_junctions': sum(value > 0 for value in counts),
+            'minimum_junction_spanning_templates': min(counts) if counts else 'NA',
+            'junction_template_counts': ','.join(map(str, counts)) if counts else 'NA',
+        })
+PY
 
     samtools view -@ "$THREADS" -b -q 20 \
         -o "$readback_dir/candidates.mapq20.bam" "$readback_dir/candidates.bam"
@@ -2265,13 +2423,14 @@ PY
 
 build_locus_summary() {
     python3 - "$OUTDIR/final" "$EXPECTED_TAXONOMY" \
-        "$TAXONOMY_NEAR_TOP_FRACTION" <<'PY'
+        "$TAXONOMY_NEAR_TOP_FRACTION" "$MIN_JUNCTION_READS" <<'PY'
 import csv, re, sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
 expected = sys.argv[2].strip()
 near_top_fraction = float(sys.argv[3])
+min_junction_reads = int(sys.argv[4])
 ranks = ('domain','kingdom','phylum','class','order','family','genus','species')
 
 def rows(path):
@@ -2493,9 +2652,230 @@ with (root / 'rrna_locus_summary.tsv').open('w', newline='') as handle:
                 row[f'{marker}_top_{suffix}'] = hit(contig, marker, source)
         out.writerow(row)
 
-# Keep the master summaries intentionally concise and contig-only. Coordinates
-# come from ITSx for complete loci and from anchor alignments for partial SSU or
-# LSU contigs. The complete audit table remains rrna_locus_summary.tsv.
+def fasta_records(path):
+    records, name, description, sequence = {}, None, '', []
+    if not path.exists() or path.stat().st_size == 0:
+        return records
+    with path.open() as handle:
+        for line in handle:
+            line = line.rstrip('\n')
+            if line.startswith('>'):
+                if name is not None:
+                    records[name] = (description, ''.join(sequence))
+                description = line[1:]
+                name = description.split()[0]
+                sequence = []
+            elif name is not None:
+                sequence.append(line.strip())
+        if name is not None:
+            records[name] = (description, ''.join(sequence))
+    return records
+
+def write_fasta(path, entries):
+    with path.open('w') as handle:
+        for header, sequence in entries:
+            handle.write(f'>{header}\n')
+            for start in range(0, len(sequence), 80):
+                handle.write(sequence[start:start + 80] + '\n')
+
+# Graph paths are internal candidates until they pass structural, junction, and
+# SSU/LSU concordance checks. Every enumerated path remains under validation/.
+graph_dir = root.parent / 'validation' / 'graph_paths'
+path_summary = {r['path_id']: r for r in rows(graph_dir / 'graph_path_summary.tsv')}
+junction_support = {r['path_id']: r for r in rows(graph_dir / 'junction_support.tsv')}
+duplicate_native = {r['path_id']: r for r in rows(graph_dir / 'duplicate_native_paths.tsv')}
+oriented_records = fasta_records(root / 'oriented_dual_anchor_contigs.fasta')
+raw_path_records = fasta_records(graph_dir / 'graph_candidate_paths.fasta')
+
+path_decisions = {}
+accepted_paths = []
+for path_id in sorted(path_summary):
+    summary = path_summary[path_id]
+    decision = {
+        'path_id': path_id,
+        'promoted_locus': 'NA',
+        'length_bp': summary.get('length_bp', 'NA'),
+        'node_count': summary.get('node_count', 'NA'),
+        'junction_count': 'NA',
+        'supported_junctions': 'NA',
+        'minimum_junction_spanning_templates': 'NA',
+        'SSU_phylum': 'NA',
+        'ITS_phylum': 'NA',
+        'LSU_phylum': 'NA',
+        'path_status': 'UNRESOLVED_PATH',
+        'consensus_taxonomy': 'NA',
+        'reason': 'path was not evaluated',
+    }
+    if path_id in duplicate_native:
+        decision['path_status'] = 'DUPLICATE_NATIVE_CONTIG'
+        decision['reason'] = ('exact sequence duplicate of ' +
+                              duplicate_native[path_id]['duplicate_native_contig'])
+        path_decisions[path_id] = decision
+        continue
+    if path_id not in catalog:
+        decision['path_status'] = 'FAIL_NOT_ANALYZED'
+        decision['reason'] = 'path was absent from the analysis candidate set'
+        path_decisions[path_id] = decision
+        continue
+
+    path_layout = layout.get(path_id, {}).get('layout_status', 'NA')
+    structure = itsx.get(path_id, {}).get('status', 'NA')
+    support = junction_support.get(path_id, {})
+    junction_count = int(support.get('junction_count', '0') or 0)
+    minimum_support_text = support.get('minimum_junction_spanning_templates', 'NA') or 'NA'
+    minimum_support = (None if minimum_support_text == 'NA'
+                       else int(minimum_support_text))
+    ssu, _ = marker_consensus(path_id, 'SSU')
+    its, _ = marker_consensus(path_id, 'ITS')
+    lsu, _ = marker_consensus(path_id, 'LSU')
+    ssu_phylum = ssu.get('phylum', 'NA')
+    its_phylum = its.get('phylum', 'NA')
+    lsu_phylum = lsu.get('phylum', 'NA')
+    decision.update({
+        'junction_count': str(junction_count),
+        'supported_junctions': support.get('supported_junctions', 'NA') or 'NA',
+        'minimum_junction_spanning_templates': minimum_support_text,
+        'SSU_phylum': ssu_phylum,
+        'ITS_phylum': its_phylum,
+        'LSU_phylum': lsu_phylum,
+        'consensus_taxonomy': taxonomy[path_id]['consensus_taxonomy'],
+    })
+
+    if path_layout != 'PASS_dual_anchor':
+        decision['path_status'] = 'FAIL_ANCHOR_LAYOUT'
+        decision['reason'] = f'anchor layout status was {path_layout}'
+    elif structure != 'PASS_complete_ITS':
+        decision['path_status'] = 'FAIL_STRUCTURE'
+        decision['reason'] = f'ITSx structure status was {structure}'
+    elif junction_count > 0 and minimum_support is None:
+        decision['path_status'] = 'FAIL_NO_JUNCTION_READBACK'
+        decision['reason'] = 'junction support was unavailable'
+    elif (junction_count > 0 and minimum_support is not None and
+          minimum_support < min_junction_reads):
+        decision['path_status'] = 'FAIL_UNSUPPORTED_JUNCTION'
+        decision['reason'] = (f'minimum junction support {minimum_support} was below '
+                              f'{min_junction_reads} templates')
+    elif not resolved(ssu_phylum) or not resolved(lsu_phylum):
+        decision['path_status'] = 'UNRESOLVED_PATH'
+        decision['reason'] = 'SSU or LSU consensus was unresolved at phylum'
+    elif ssu_phylum.casefold() != lsu_phylum.casefold():
+        decision['path_status'] = 'FAIL_CROSS_PHYLUM_CHIMERA'
+        decision['reason'] = f'SSU={ssu_phylum}; LSU={lsu_phylum}'
+    else:
+        lower_conflict = next((rank for rank in ('class','order','family','genus','species')
+                               if resolved(ssu.get(rank, 'NA')) and
+                               resolved(lsu.get(rank, 'NA')) and
+                               ssu[rank].casefold() != lsu[rank].casefold()), None)
+        if resolved(its_phylum) and its_phylum.casefold() != ssu_phylum.casefold():
+            decision['path_status'] = 'WARN_ITS_CONFLICT'
+            decision['reason'] = (f'SSU/LSU agree on {ssu_phylum}; '
+                                  f'ITS suggests {its_phylum}')
+        elif lower_conflict:
+            decision['path_status'] = 'WARN_LOWER_RANK_CONFLICT'
+            decision['reason'] = (f'SSU and LSU agree at phylum but differ at '
+                                  f'{lower_conflict}')
+        elif resolved(its_phylum):
+            decision['path_status'] = 'PASS_CONCORDANT_ITS_SUPPORTED'
+            decision['reason'] = 'SSU, LSU, and ITS agree at phylum'
+        else:
+            decision['path_status'] = 'PASS_CONCORDANT_PATH'
+            decision['reason'] = 'SSU and LSU agree at phylum; ITS unresolved'
+        accepted_paths.append(path_id)
+    path_decisions[path_id] = decision
+
+promoted = {path_id: f'ITSME_LOCUS_{number:06d}'
+            for number, path_id in enumerate(accepted_paths, 1)}
+for path_id, promoted_id in promoted.items():
+    path_decisions[path_id]['promoted_locus'] = promoted_id
+
+path_fields = ['path_id','promoted_locus','length_bp','node_count','junction_count',
+               'supported_junctions','minimum_junction_spanning_templates',
+               'SSU_phylum','ITS_phylum','LSU_phylum','path_status',
+               'consensus_taxonomy','reason']
+with (root / 'graph_locus_validation.tsv').open('w', newline='') as handle:
+    writer = csv.DictWriter(handle, fieldnames=path_fields, delimiter='\t', lineterminator='\n')
+    writer.writeheader()
+    for path_id in sorted(path_decisions):
+        writer.writerow(path_decisions[path_id])
+
+with (root / 'locus_source_map.tsv').open('w', newline='') as handle:
+    fields = ['locus','source_path','node_path','path_status']
+    writer = csv.DictWriter(handle, fieldnames=fields, delimiter='\t', lineterminator='\n')
+    writer.writeheader()
+    for path_id in accepted_paths:
+        writer.writerow({'locus': promoted[path_id], 'source_path': path_id,
+                         'node_path': path_summary[path_id].get('node_path', 'NA'),
+                         'path_status': path_decisions[path_id]['path_status']})
+
+reconstructed_entries = []
+for path_id in accepted_paths:
+    if path_id not in oriented_records:
+        continue
+    _, sequence = oriented_records[path_id]
+    decision = path_decisions[path_id]
+    reconstructed_entries.append((
+        f'{promoted[path_id]} source_path={path_id} '
+        f'path_status={decision["path_status"]}', sequence))
+write_fasta(root / 'reconstructed_graph_loci.fasta', reconstructed_entries)
+
+rejected_entries = []
+for path_id in sorted(path_summary):
+    if path_id in promoted or path_id not in raw_path_records:
+        continue
+    _, sequence = raw_path_records[path_id]
+    rejected_entries.append((
+        f'{path_id} path_status={path_decisions[path_id]["path_status"]}', sequence))
+write_fasta(graph_dir / 'rejected_graph_paths.fasta', rejected_entries)
+
+# Retain the unfiltered oriented analysis set for complete auditability, then
+# make the final FASTA contain native assemblies plus promoted graph loci only.
+write_fasta(root.parent / 'validation' / 'oriented_locus_candidates.fasta',
+            [(description, sequence) for description, sequence in oriented_records.values()])
+final_oriented = []
+for contig, (description, sequence) in oriented_records.items():
+    source = catalog.get(contig, {}).get('source', 'NA')
+    if source == 'spades_contig':
+        final_oriented.append((description, sequence))
+    elif contig in promoted:
+        final_oriented.append((
+            f'{promoted[contig]} source_path={contig} '
+            f'path_status={path_decisions[contig]["path_status"]}', sequence))
+write_fasta(root / 'oriented_dual_anchor_contigs.fasta', final_oriented)
+write_fasta(root / 'rrna_dual_anchor_contigs.fasta', final_oriented)
+with (root / 'dual_anchor_contig_names.txt').open('w') as handle:
+    for description, _ in final_oriented:
+        handle.write(description.split()[0] + '\n')
+
+# The whole-locus FASTA contains complete native loci and accepted reconstructed
+# graph loci. Exact sequence duplicates are collapsed in favor of native contigs.
+complete_locus_entries, complete_sequences = [], set()
+for contig, (description, sequence) in oriented_records.items():
+    source = catalog.get(contig, {}).get('source', 'NA')
+    if source != 'spades_contig' or itsx.get(contig, {}).get('status') != 'PASS_complete_ITS':
+        continue
+    complete_locus_entries.append((description, sequence))
+    complete_sequences.add(sequence)
+for header, sequence in reconstructed_entries:
+    if sequence not in complete_sequences:
+        complete_locus_entries.append((header, sequence))
+        complete_sequences.add(sequence)
+write_fasta(root / 'complete_rDNA_loci.fasta', complete_locus_entries)
+
+# ITSx was intentionally run on every candidate. Final region FASTAs retain all
+# native results but only taxonomically promoted graph paths.
+for filename in ('complete_ITS.fasta','ITS1.fasta','5_8S.fasta','ITS2.fasta'):
+    region_records = fasta_records(root / filename)
+    entries = []
+    for contig, (description, sequence) in region_records.items():
+        source = catalog.get(contig, {}).get('source', 'NA')
+        if source == 'spades_contig':
+            entries.append((description, sequence))
+        elif contig in promoted:
+            entries.append((f'{promoted[contig]} source_path={contig}', sequence))
+    write_fasta(root / filename, entries)
+
+# Keep the master summaries concise. Native contigs are all retained; graph
+# paths appear only after promotion and use ITSME_LOCUS identifiers.
 master_fields = ['contig','locus_type','length_bp','SSU_coordinates',
                  'ITS1_coordinates','5.8S_coordinates','ITS2_coordinates',
                  'LSU_coordinates','mean_depth','taxonomy_status',
@@ -2504,6 +2884,12 @@ master_rows = []
 for contig in sorted(catalog):
     x, c, tax = itsx.get(contig, {}), coverage.get(contig, {}), taxonomy[contig]
     candidate = catalog[contig]
+    source = candidate.get('source', 'NA')
+    if source == 'graph_path' and contig not in promoted:
+        continue
+    report_name = promoted.get(contig, contig)
+    report_type = ('RECONSTRUCTED_GRAPH_LOCUS' if source == 'graph_path'
+                   else candidate.get('locus_type','NA'))
     coordinates = {
         'SSU': x.get('SSU', ssu_anchor_coordinates.get(contig, 'NA')),
         'ITS1': x.get('ITS1', 'NA'),
@@ -2516,7 +2902,7 @@ for contig in sorted(catalog):
     if match:
         header_depth = match.group(1)
     master_rows.append({
-        'contig': contig, 'locus_type':candidate.get('locus_type','NA'),
+        'contig': report_name, 'locus_type':report_type,
         'length_bp': candidate.get('length_bp',x.get('length','NA')),
         'SSU_coordinates': coordinates['SSU'],
         'ITS1_coordinates': coordinates['ITS1'],
@@ -2915,11 +3301,11 @@ extract_fasta_by_names "$OUTDIR/final/rrna_candidate_contig_names.txt" \
 DUAL_COUNT=0
 if (( ${#LEFT_DATABASES[@]} > 0 && ${#RIGHT_DATABASES[@]} > 0 )); then
     if [[ "$GRAPH_PATHS" == true ]]; then
-        log "Diagnostic graph analysis: enumerating bounded paths; inferred paths will not enter contig reports."
+        log "Graph-aware reconstruction: enumerating bounded 18S-to-28S paths."
     fi
     enumerate_graph_paths
-    prepare_native_contig_candidates
-    ALL_LOCUS_CANDIDATES="$OUTDIR/validation/native_contig_candidates.fasta"
+    prepare_locus_candidate_set
+    ALL_LOCUS_CANDIDATES="$OUTDIR/validation/analysis_locus_candidates.fasta"
 
     contig_anchor_hits "$ALL_LOCUS_CANDIDATES" "$LEFT_INDEX" \
         "$OUTDIR/final/left_anchor_hits.tsv" "$OUTDIR/final/left_anchor.log"
@@ -2953,6 +3339,9 @@ if (( ${#LEFT_DATABASES[@]} > 0 && ${#RIGHT_DATABASES[@]} > 0 )); then
     run_competitive_readback
     run_ncbi_classification
     build_locus_summary
+    ORIENTED_COUNT=$(awk '/^>/ { n++ } END { print n + 0 }' \
+        "$OUTDIR/final/oriented_dual_anchor_contigs.fasta")
+    DUAL_COUNT="$ORIENTED_COUNT"
 else
     ORIENTED_COUNT=0
     AMBIGUOUS_COUNT=0
@@ -2960,8 +3349,16 @@ else
     : > "$OUTDIR/final/ambiguous_dual_anchor_contigs.fasta"
     mkdir -p "$OUTDIR/validation/graph_paths"
     : > "$OUTDIR/validation/graph_paths/graph_candidate_paths.fasta"
-    : > "$OUTDIR/validation/graph_paths/graph_path_summary.tsv"
-    cp -- "$CANDIDATE_CONTIGS" "$OUTDIR/validation/native_contig_candidates.fasta"
+    printf 'path_id\tlength_bp\tnode_count\tminimum_graph_depth\tmean_graph_depth\tleft_segment\tright_segment\tnode_path\tjunction_positions\tpath_status\n' \
+        > "$OUTDIR/validation/graph_paths/graph_path_summary.tsv"
+    printf 'path_id\tduplicate_native_contig\tlength_bp\treason\n' \
+        > "$OUTDIR/validation/graph_paths/duplicate_native_paths.tsv"
+    printf 'path_id\tjunction_count\tsupported_junctions\tminimum_junction_spanning_templates\tjunction_template_counts\n' \
+        > "$OUTDIR/validation/graph_paths/junction_support.tsv"
+    : > "$OUTDIR/validation/graph_paths/rejected_graph_paths.fasta"
+    cp -- "$CANDIDATE_CONTIGS" "$OUTDIR/validation/analysis_locus_candidates.fasta"
+    printf 'contig\tsource\tsource_header\tlength_bp\n' \
+        > "$OUTDIR/validation/locus_candidate_provenance.tsv"
     : > "$OUTDIR/final/partial_18S_contigs.fasta"
     : > "$OUTDIR/final/partial_28S_contigs.fasta"
     : > "$OUTDIR/final/partial_locus_contigs.fasta"
@@ -2983,6 +3380,12 @@ else
     : > "$OUTDIR/final/taxonomy_validation.tsv"
     : > "$OUTDIR/final/rrna_locus_summary.tsv"
     : > "$OUTDIR/final/master_summary.tsv"
+    : > "$OUTDIR/final/reconstructed_graph_loci.fasta"
+    : > "$OUTDIR/final/complete_rDNA_loci.fasta"
+    printf 'path_id\tpromoted_locus\tlength_bp\tnode_count\tjunction_count\tsupported_junctions\tminimum_junction_spanning_templates\tSSU_phylum\tITS_phylum\tLSU_phylum\tpath_status\tconsensus_taxonomy\treason\n' \
+        > "$OUTDIR/final/graph_locus_validation.tsv"
+    printf 'locus\tsource_path\tnode_path\tpath_status\n' \
+        > "$OUTDIR/final/locus_source_map.tsv"
     : > "$OUTDIR/master_summary.csv"
 fi
 
@@ -2995,6 +3398,8 @@ done
 read -r ALL_CONTIG_COUNT ALL_BP < <(fasta_stats "$ALL_CONTIGS")
 read -r CANDIDATE_COUNT CANDIDATE_BP < <(fasta_stats "$CANDIDATE_CONTIGS")
 read -r COMPLETE_ITS_COUNT COMPLETE_ITS_BP < <(fasta_stats "$OUTDIR/final/complete_ITS.fasta")
+read -r COMPLETE_LOCUS_COUNT COMPLETE_LOCUS_BP < <(fasta_stats "$OUTDIR/final/complete_rDNA_loci.fasta")
+read -r PROMOTED_GRAPH_COUNT PROMOTED_GRAPH_BP < <(fasta_stats "$OUTDIR/final/reconstructed_graph_loci.fasta")
 if [[ -s "$OUTDIR/validation/graph_paths/graph_candidate_paths.fasta" ]]; then
     read -r GRAPH_PATH_COUNT GRAPH_PATH_BP < <(
         fasta_stats "$OUTDIR/validation/graph_paths/graph_candidate_paths.fasta")
@@ -3004,16 +3409,24 @@ else
 fi
 read -r PARTIAL_LOCUS_COUNT PARTIAL_LOCUS_BP < <(fasta_stats "$OUTDIR/final/partial_locus_contigs.fasta")
 VARIANT_COUNT=$(awk 'END { print (NR > 0 ? NR - 1 : 0) }' "$OUTDIR/final/residual_variants.tsv")
-EXPECTED_PASS_COUNT=$(awk -F '\t' 'NR > 1 && ($3 == "PASS_expected_taxon" || $3 == "PARTIAL_expected_taxon") { n++ } END { print n + 0 }' \
-    "$OUTDIR/final/taxonomy_validation.tsv")
-NON_TARGET_COUNT=$(awk -F '\t' 'NR > 1 && ($3 == "PASS_non_target_taxon" || $3 == "PARTIAL_non_target_taxon") { n++ } END { print n + 0 }' \
-    "$OUTDIR/final/taxonomy_validation.tsv")
-COHERENT_TAXONOMY_COUNT=$(awk -F '\t' 'NR > 1 && ($3 == "PASS_taxonomically_coherent" || $3 == "PARTIAL_taxonomically_assigned") { n++ } END { print n + 0 }' \
-    "$OUTDIR/final/taxonomy_validation.tsv")
-TAXONOMIC_CHIMERA_COUNT=$(awk -F '\t' 'NR > 1 && $3 == "FAIL_taxonomic_chimera" { n++ } END { print n + 0 }' \
-    "$OUTDIR/final/taxonomy_validation.tsv")
-UNRESOLVED_TAXONOMY_COUNT=$(awk -F '\t' 'NR > 1 && ($3 == "UNRESOLVED" || $3 == "PARTIAL_unresolved") { n++ } END { print n + 0 }' \
-    "$OUTDIR/final/taxonomy_validation.tsv")
+# Report taxonomy counts for the concise biological output, not for rejected
+# internal path candidates retained beneath validation/.
+EXPECTED_PASS_COUNT=$(awk -F ',' 'NR > 1 && ($10 == "PASS_expected_taxon" || $10 == "PARTIAL_expected_taxon") { n++ } END { print n + 0 }' \
+    "$OUTDIR/master_summary.csv")
+NON_TARGET_COUNT=$(awk -F ',' 'NR > 1 && ($10 == "PASS_non_target_taxon" || $10 == "PARTIAL_non_target_taxon") { n++ } END { print n + 0 }' \
+    "$OUTDIR/master_summary.csv")
+COHERENT_TAXONOMY_COUNT=$(awk -F ',' 'NR > 1 && ($10 == "PASS_taxonomically_coherent" || $10 == "PARTIAL_taxonomically_assigned") { n++ } END { print n + 0 }' \
+    "$OUTDIR/master_summary.csv")
+TAXONOMIC_CHIMERA_COUNT=$(awk -F ',' 'NR > 1 && $10 == "FAIL_taxonomic_chimera" { n++ } END { print n + 0 }' \
+    "$OUTDIR/master_summary.csv")
+UNRESOLVED_TAXONOMY_COUNT=$(awk -F ',' 'NR > 1 && ($10 == "UNRESOLVED" || $10 == "PARTIAL_unresolved") { n++ } END { print n + 0 }' \
+    "$OUTDIR/master_summary.csv")
+GRAPH_CHIMERA_COUNT=$(awk -F '\t' 'NR > 1 && $11 == "FAIL_CROSS_PHYLUM_CHIMERA" { n++ } END { print n + 0 }' \
+    "$OUTDIR/final/graph_locus_validation.tsv")
+GRAPH_UNRESOLVED_COUNT=$(awk -F '\t' 'NR > 1 && $11 == "UNRESOLVED_PATH" { n++ } END { print n + 0 }' \
+    "$OUTDIR/final/graph_locus_validation.tsv")
+GRAPH_UNSUPPORTED_COUNT=$(awk -F '\t' 'NR > 1 && ($11 == "FAIL_UNSUPPORTED_JUNCTION" || $11 == "FAIL_NO_JUNCTION_READBACK") { n++ } END { print n + 0 }' \
+    "$OUTDIR/final/graph_locus_validation.tsv")
 FINAL_PAIR_COUNT=$(fastq_count "$FINAL_R1")
 FINAL_SINGLE_COUNT=$(fastq_count "$FINAL_SINGLE")
 ELAPSED=$(format_duration "$SECONDS")
@@ -3052,13 +3465,21 @@ printf '%s\n' \
     "All assembled bp: $ALL_BP" \
     "Seed-anchored candidate contigs: $CANDIDATE_COUNT" \
     "Seed-anchored candidate bp: $CANDIDATE_BP" \
-    "Diagnostic graph paths (excluded from reports): $GRAPH_PATH_COUNT" \
-    "Diagnostic graph-path bp: $GRAPH_PATH_BP" \
+    "Bounded graph paths evaluated: $GRAPH_PATH_COUNT" \
+    "Bounded graph-path bp: $GRAPH_PATH_BP" \
+    "Promoted reconstructed graph loci: $PROMOTED_GRAPH_COUNT" \
+    "Promoted reconstructed graph-locus bp: $PROMOTED_GRAPH_BP" \
+    "Graph paths rejected as cross-phylum chimeras: $GRAPH_CHIMERA_COUNT" \
+    "Graph paths unresolved at phylum: $GRAPH_UNRESOLVED_COUNT" \
+    "Graph paths rejected for junction support: $GRAPH_UNSUPPORTED_COUNT" \
+    "Minimum templates per graph junction: $MIN_JUNCTION_READS" \
     "Dual-anchor contigs: $DUAL_COUNT" \
     "Validated and oriented dual-anchor contigs: $ORIENTED_COUNT" \
     "Ambiguous dual-anchor contigs: $AMBIGUOUS_COUNT" \
     "Complete ITS regions: $COMPLETE_ITS_COUNT" \
     "Complete ITS bp: $COMPLETE_ITS_BP" \
+    "Complete native and reconstructed rDNA loci: $COMPLETE_LOCUS_COUNT" \
+    "Complete native and reconstructed rDNA bp: $COMPLETE_LOCUS_BP" \
     "Partial or ambiguous loci retained: $PARTIAL_LOCUS_COUNT" \
     "Partial or ambiguous locus bp: $PARTIAL_LOCUS_BP" \
     "Residual unphased variants: $VARIANT_COUNT" \
@@ -3080,10 +3501,13 @@ fi
 
 log "Finished. Candidate contigs: $CANDIDATE_CONTIGS"
 if [[ "$GRAPH_PATHS" == true ]]; then
-    log "Diagnostic graph paths: $OUTDIR/validation/graph_paths/graph_candidate_paths.fasta"
+    log "All bounded graph paths: $OUTDIR/validation/graph_paths/graph_candidate_paths.fasta"
+    log "Promoted reconstructed loci: $OUTDIR/final/reconstructed_graph_loci.fasta"
+    log "Graph-path decisions: $OUTDIR/final/graph_locus_validation.tsv"
 fi
 log "Dual-anchor contigs: $DUAL_CONTIGS"
 log "Oriented validated contigs: $OUTDIR/final/oriented_dual_anchor_contigs.fasta"
+log "Complete native and reconstructed rDNA loci: $OUTDIR/final/complete_rDNA_loci.fasta"
 log "Complete ITS regions: $OUTDIR/final/complete_ITS.fasta"
 log "Validation report: $OUTDIR/final/contig_validation.tsv"
 log "Contig support: $OUTDIR/final/contig_support.tsv"
