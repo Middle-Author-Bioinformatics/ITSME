@@ -22,7 +22,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 SECONDS=0
 
-VERSION="1.7.0"
+VERSION="1.7.2"
 
 READS_1=""
 READS_2=""
@@ -83,7 +83,7 @@ NCBI_REPORT_HITS=10
 TAXDUMP_DIR="${NCBI_TAXDUMP_DIR:-}"
 TAXDUMP_DIR_EXPLICIT=false
 # Retained only so older commands do not fail. Expected taxonomy never changes
-# recruitment, assembly, taxonomy, or reporting in v1.7.0.
+# recruitment, assembly, taxonomy, or reporting in v1.7.2.
 EXPECTED_TAXONOMY=""
 TAXONOMY_NEAR_TOP_FRACTION=0.95
 GRAPH_PATHS=true
@@ -114,7 +114,7 @@ ASSEMBLY_SINGLE_FILES=()
 
 usage() {
     cat <<'EOF'
-ITSME v1.7.0 - graph-aware eukaryotic rDNA recruitment and classification
+ITSME v1.7.2 - graph-aware eukaryotic rDNA recruitment and classification
 
 Usage:
   itsme.sh -1 R1.fastq.gz -2 R2.fastq.gz \
@@ -245,7 +245,10 @@ Assembly and output:
 Principal outputs:
   OUTPUT/final/rrna_candidate_contigs.fasta
   OUTPUT/final/reconstructed_graph_loci.fasta
+  OUTPUT/final/reported_loci.fasta
   OUTPUT/final/complete_rDNA_loci.fasta
+  OUTPUT/final/taxonomic_chimeras.fasta
+  OUTPUT/final/taxonomic_chimeras.tsv
   OUTPUT/final/graph_locus_validation.tsv
   OUTPUT/final/locus_source_map.tsv
   OUTPUT/validation/graph_paths/collapsed_same_taxonomy_paths.fasta
@@ -267,6 +270,8 @@ Principal outputs:
   OUTPUT/final/rrna_locus_summary.tsv
   OUTPUT/final/master_summary.tsv
   OUTPUT/master_summary.csv
+  OUTPUT/final/partials.tsv
+  OUTPUT/partials.csv
   OUTPUT/final/all_assembled_contigs.fasta
   OUTPUT/final/accepted_R1.fastq.gz
   OUTPUT/final/accepted_R2.fastq.gz
@@ -2573,6 +2578,13 @@ def locus_consensus(ssu, lsu):
         consensus[rank] = left
     return consensus
 
+def component_conflict_rank(ssu, lsu, tested_ranks=('domain','kingdom','phylum')):
+    """Return the first resolved SSU/LSU disagreement at phylum or above."""
+    return next((rank for rank in tested_ranks
+                 if resolved(ssu.get(rank, 'NA')) and
+                 resolved(lsu.get(rank, 'NA')) and
+                 ssu[rank].casefold() != lsu[rank].casefold()), None)
+
 def taxonomy_result(contig, locus_type):
     ssu, ssu_n = marker_consensus(contig, 'SSU')
     its, its_n = marker_consensus(contig, 'ITS')
@@ -2584,6 +2596,7 @@ def taxonomy_result(contig, locus_type):
     else:
         combined = locus_consensus(ssu, lsu)
     ssu_phylum, lsu_phylum = ssu.get('phylum', 'NA'), lsu.get('phylum', 'NA')
+    conflict_rank = component_conflict_rank(ssu, lsu)
 
     note = ''
     if locus_type in {'PARTIAL_18S', 'PARTIAL_28S'}:
@@ -2594,10 +2607,10 @@ def taxonomy_result(contig, locus_type):
             note = f'{marker_name}-only locus was unresolved at phylum'
         else:
             status = 'PARTIAL_taxonomically_assigned'
-    elif (resolved(ssu_phylum) and resolved(lsu_phylum) and
-            ssu_phylum.casefold() != lsu_phylum.casefold()):
+    elif conflict_rank:
         status = 'CHIMERA'
-        note = f'SSU phylum {ssu_phylum} conflicts with LSU phylum {lsu_phylum}'
+        note = (f'SSU {conflict_rank} {ssu.get(conflict_rank, "NA")} conflicts '
+                f'with LSU {conflict_rank} {lsu.get(conflict_rank, "NA")}')
     elif not resolved(ssu_phylum) or not resolved(lsu_phylum):
         status = 'UNRESOLVED'
         note = 'SSU or LSU consensus was unresolved at phylum'
@@ -2611,6 +2624,7 @@ def taxonomy_result(contig, locus_type):
 
     return {
         'taxonomy_status': status,
+        'conflict_rank': conflict_rank or 'NA',
         **{f'consensus_{rank}': combined[rank] for rank in ranks},
         'consensus_taxonomy': lineage_text(combined),
         'component_taxonomies': component_taxonomies,
@@ -2623,7 +2637,7 @@ def taxonomy_result(contig, locus_type):
         'validation_note': note or 'NA'
     }
 
-taxonomy_fields = ['contig','locus_type','taxonomy_status',
+taxonomy_fields = ['contig','locus_type','taxonomy_status','conflict_rank',
                    *[f'consensus_{rank}' for rank in ranks],
                    'consensus_taxonomy','component_taxonomies','SSU_consensus_taxonomy',
                    'ITS_consensus_taxonomy','LSU_consensus_taxonomy',
@@ -2645,6 +2659,7 @@ detailed_fields = ['contig','contig_length','locus_type','source','orientation',
           '18S_anchor_identity','28S_anchor_identity','readback_coverage_percent','readback_mean_depth',
           'readback_mean_mapq','unique_mapped_reads','unique_coverage_percent',
           'unique_mean_depth','taxonomy_status',
+          'conflict_rank',
           *[f'consensus_{rank}' for rank in ranks],
           'consensus_taxonomy','component_taxonomies','SSU_consensus_taxonomy','ITS_consensus_taxonomy',
           'LSU_consensus_taxonomy','SSU_near_top_hits','ITS_near_top_hits',
@@ -2727,6 +2742,7 @@ path_summary = {r['path_id']: r for r in rows(graph_dir / 'graph_path_summary.ts
 junction_support = {r['path_id']: r for r in rows(graph_dir / 'junction_support.tsv')}
 duplicate_native = {r['path_id']: r for r in rows(graph_dir / 'duplicate_native_paths.tsv')}
 oriented_records = fasta_records(root / 'oriented_dual_anchor_contigs.fasta')
+native_candidate_records = fasta_records(root / 'rrna_candidate_contigs.fasta')
 raw_path_records = fasta_records(graph_dir / 'graph_candidate_paths.fasta')
 
 path_decisions = {}
@@ -2749,6 +2765,7 @@ for path_id in sorted(path_summary):
         'path_status': 'UNRESOLVED_PATH',
         'consensus_taxonomy': 'NA',
         'reason': 'path was not evaluated',
+        'conflict_rank': 'NA',
     }
     if path_id in duplicate_native:
         decision['path_status'] = 'DUPLICATE_NATIVE_CONTIG'
@@ -2780,6 +2797,7 @@ for path_id in sorted(path_summary):
     ssu_phylum = ssu.get('phylum', 'NA')
     its_phylum = its.get('phylum', 'NA')
     lsu_phylum = lsu.get('phylum', 'NA')
+    conflict_rank = component_conflict_rank(ssu, lsu)
     decision.update({
         'junction_count': str(junction_count),
         'supported_junctions': support.get('supported_junctions', 'NA') or 'NA',
@@ -2790,6 +2808,7 @@ for path_id in sorted(path_summary):
         'SSU_taxonomy': lineage_text(ssu),
         'LSU_taxonomy': lineage_text(lsu),
         'consensus_taxonomy': taxonomy[path_id]['consensus_taxonomy'],
+        'conflict_rank': conflict_rank or 'NA',
     })
 
     if path_layout != 'PASS_dual_anchor':
@@ -2806,13 +2825,14 @@ for path_id in sorted(path_summary):
         decision['path_status'] = 'FAIL_UNSUPPORTED_JUNCTION'
         decision['reason'] = (f'minimum junction support {minimum_support} was below '
                               f'{min_junction_reads} templates')
+    elif conflict_rank:
+        decision['path_status'] = 'CHIMERA'
+        decision['reason'] = (f'conflict at {conflict_rank}; '
+                              f'SSU={lineage_text(ssu)}; '
+                              f'LSU={lineage_text(lsu)}')
     elif not resolved(ssu_phylum) or not resolved(lsu_phylum):
         decision['path_status'] = 'UNRESOLVED_PATH'
         decision['reason'] = 'SSU or LSU consensus was unresolved at phylum'
-    elif ssu_phylum.casefold() != lsu_phylum.casefold():
-        decision['path_status'] = 'CHIMERA'
-        decision['reason'] = (f'SSU={lineage_text(ssu)}; '
-                              f'LSU={lineage_text(lsu)}')
     else:
         lower_conflict = next((rank for rank in ('class','order','family','genus','species')
                                if resolved(ssu.get(rank, 'NA')) and
@@ -2872,7 +2892,7 @@ for path_id, representative in collapsed_to.items():
 path_fields = ['path_id','promoted_locus','length_bp','node_count','junction_count',
                'supported_junctions','minimum_junction_spanning_templates',
                'SSU_phylum','ITS_phylum','LSU_phylum','SSU_taxonomy','LSU_taxonomy','path_status',
-               'consensus_taxonomy','reason']
+               'consensus_taxonomy','reason','conflict_rank']
 with (root / 'graph_locus_validation.tsv').open('w', newline='') as handle:
     writer = csv.DictWriter(handle, fieldnames=path_fields, delimiter='\t', lineterminator='\n')
     writer.writeheader()
@@ -2919,14 +2939,45 @@ for path_id, representative in sorted(collapsed_to.items()):
         f'path_status=COLLAPSED_SAME_TAXONOMY', sequence))
 write_fasta(graph_dir / 'collapsed_same_taxonomy_paths.fasta', collapsed_entries)
 
+# Chimeras that conflict at domain, kingdom, or phylum are excluded from the
+# concise biological outputs but retained here with both component assignments.
+chimera_entries, chimera_rows = [], []
+for contig, (description, sequence) in oriented_records.items():
+    source = catalog.get(contig, {}).get('source', 'NA')
+    is_chimera = taxonomy.get(contig, {}).get('taxonomy_status') == 'CHIMERA'
+    if source == 'graph_path':
+        is_chimera = path_decisions.get(contig, {}).get('path_status') == 'CHIMERA'
+    if not is_chimera:
+        continue
+    tax = taxonomy[contig]
+    chimera_entries.append((
+        f'{description} taxonomy_status=CHIMERA '
+        f'conflict_rank={tax.get("conflict_rank", "NA")}', sequence))
+    chimera_rows.append({
+        'sequence_id': contig,
+        'source': source,
+        'length_bp': str(len(sequence)),
+        'conflict_rank': tax.get('conflict_rank', 'NA'),
+        'SSU_taxonomy': tax.get('SSU_consensus_taxonomy', 'NA'),
+        'LSU_taxonomy': tax.get('LSU_consensus_taxonomy', 'NA'),
+    })
+write_fasta(root / 'taxonomic_chimeras.fasta', chimera_entries)
+with (root / 'taxonomic_chimeras.tsv').open('w', newline='') as handle:
+    fields = ['sequence_id','source','length_bp','conflict_rank',
+              'SSU_taxonomy','LSU_taxonomy']
+    writer = csv.DictWriter(handle, fieldnames=fields, delimiter='\t', lineterminator='\n')
+    writer.writeheader()
+    writer.writerows(chimera_rows)
+
 # Retain the unfiltered oriented analysis set for complete auditability, then
-# make the final FASTA contain native assemblies plus promoted graph loci only.
+# make the final FASTA contain nonchimeric native assemblies plus promoted graph loci.
 write_fasta(root.parent / 'validation' / 'oriented_locus_candidates.fasta',
             [(description, sequence) for description, sequence in oriented_records.values()])
 final_oriented = []
 for contig, (description, sequence) in oriented_records.items():
     source = catalog.get(contig, {}).get('source', 'NA')
-    if source == 'spades_contig':
+    if (source == 'spades_contig' and
+            taxonomy.get(contig, {}).get('taxonomy_status') != 'CHIMERA'):
         final_oriented.append((description, sequence))
     elif contig in promoted:
         final_oriented.append((
@@ -2943,7 +2994,9 @@ with (root / 'dual_anchor_contig_names.txt').open('w') as handle:
 complete_locus_entries, complete_sequences = [], set()
 for contig, (description, sequence) in oriented_records.items():
     source = catalog.get(contig, {}).get('source', 'NA')
-    if source != 'spades_contig' or itsx.get(contig, {}).get('status') != 'PASS_complete_ITS':
+    if (source != 'spades_contig' or
+            itsx.get(contig, {}).get('status') != 'PASS_complete_ITS' or
+            taxonomy.get(contig, {}).get('taxonomy_status') == 'CHIMERA'):
         continue
     complete_locus_entries.append((description, sequence))
     complete_sequences.add(sequence)
@@ -2953,26 +3006,28 @@ for header, sequence in reconstructed_entries:
         complete_sequences.add(sequence)
 write_fasta(root / 'complete_rDNA_loci.fasta', complete_locus_entries)
 
-# ITSx was intentionally run on every candidate. Final region FASTAs retain all
-# native results but only taxonomically promoted graph paths.
+# ITSx was intentionally run on every candidate. Final region FASTAs exclude
+# upper-rank chimeras and retain only taxonomically promoted graph paths.
 for filename in ('complete_ITS.fasta','ITS1.fasta','5_8S.fasta','ITS2.fasta'):
     region_records = fasta_records(root / filename)
     entries = []
     for contig, (description, sequence) in region_records.items():
         source = catalog.get(contig, {}).get('source', 'NA')
-        if source == 'spades_contig':
+        if (source == 'spades_contig' and
+                taxonomy.get(contig, {}).get('taxonomy_status') != 'CHIMERA'):
             entries.append((description, sequence))
         elif contig in promoted:
             entries.append((f'{promoted[contig]} source_path={contig}', sequence))
     write_fasta(root / filename, entries)
 
-# Keep the master summaries concise. Native contigs are all retained; graph
-# paths appear only after promotion and use ITSME_LOCUS identifiers.
+# Keep the master summary focused on complete ITS-containing loci. Incomplete
+# nonchimeric candidates are reported separately in partials.csv/partials.tsv.
+# Upper-rank chimeras remain excluded from both and are retained separately.
 master_fields = ['contig','locus_type','length_bp','SSU_coordinates',
                  'ITS1_coordinates','5.8S_coordinates','ITS2_coordinates',
                  'LSU_coordinates','mean_depth','taxonomy_status',
-                 'consensus_taxonomy','component_taxonomies']
-master_rows = []
+                 'consensus_taxonomy']
+master_rows, partial_rows, reported_entries = [], [], []
 for contig in sorted(catalog):
     x, c, tax = itsx.get(contig, {}), coverage.get(contig, {}), taxonomy[contig]
     candidate = catalog[contig]
@@ -2980,6 +3035,8 @@ for contig in sorted(catalog):
         continue
     source = candidate.get('source', 'NA')
     if source == 'graph_path' and contig not in promoted:
+        continue
+    if tax['taxonomy_status'] == 'CHIMERA':
         continue
     report_name = promoted.get(contig, contig)
     report_type = ('RECONSTRUCTED_GRAPH_LOCUS' if source == 'graph_path'
@@ -2995,7 +3052,7 @@ for contig in sorted(catalog):
     match = re.search(r'_cov_([0-9.]+)', contig)
     if match:
         header_depth = match.group(1)
-    master_rows.append({
+    master_row = {
         'contig': report_name, 'locus_type':report_type,
         'length_bp': candidate.get('length_bp',x.get('length','NA')),
         'SSU_coordinates': coordinates['SSU'],
@@ -3005,9 +3062,27 @@ for contig in sorted(catalog):
         'LSU_coordinates': coordinates['LSU'],
         'mean_depth': c.get('meandepth',header_depth),
         'taxonomy_status': tax['taxonomy_status'],
-        'consensus_taxonomy': tax['consensus_taxonomy'],
-        'component_taxonomies': tax['component_taxonomies']
-    })
+        'consensus_taxonomy': tax['consensus_taxonomy']
+    }
+    is_complete = (report_type in {'COMPLETE_DUAL_ANCHOR',
+                                   'RECONSTRUCTED_GRAPH_LOCUS'} and
+                   x.get('status') == 'PASS_complete_ITS')
+    if is_complete:
+        master_rows.append(master_row)
+        sequence_record = (oriented_records.get(contig) or
+                           native_candidate_records.get(contig))
+        if sequence_record:
+            _, sequence = sequence_record
+            annotation = ' '.join(
+                f'{field}={master_row[field]}'
+                for field in ('locus_type','SSU_coordinates','ITS1_coordinates',
+                              '5.8S_coordinates','ITS2_coordinates','LSU_coordinates',
+                              'taxonomy_status'))
+            reported_entries.append((f'{report_name} {annotation}', sequence))
+    else:
+        partial_rows.append(master_row)
+
+write_fasta(root / 'reported_loci.fasta', reported_entries)
 
 with (root / 'master_summary.tsv').open('w', newline='') as destination:
     writer = csv.DictWriter(destination, fieldnames=master_fields, delimiter='\t', lineterminator='\n')
@@ -3017,6 +3092,14 @@ with (root.parent / 'master_summary.csv').open('w', newline='') as destination:
     writer = csv.DictWriter(destination, fieldnames=master_fields, lineterminator='\n')
     writer.writeheader()
     writer.writerows(master_rows)
+with (root / 'partials.tsv').open('w', newline='') as destination:
+    writer = csv.DictWriter(destination, fieldnames=master_fields, delimiter='\t', lineterminator='\n')
+    writer.writeheader()
+    writer.writerows(partial_rows)
+with (root.parent / 'partials.csv').open('w', newline='') as destination:
+    writer = csv.DictWriter(destination, fieldnames=master_fields, lineterminator='\n')
+    writer.writeheader()
+    writer.writerows(partial_rows)
 PY
 }
 
@@ -3483,14 +3566,22 @@ else
     : > "$OUTDIR/final/ncbi_blast_top_hits.tsv"
     : > "$OUTDIR/final/taxonomy_validation.tsv"
     : > "$OUTDIR/final/rrna_locus_summary.tsv"
-    : > "$OUTDIR/final/master_summary.tsv"
+    printf 'contig\tlocus_type\tlength_bp\tSSU_coordinates\tITS1_coordinates\t5.8S_coordinates\tITS2_coordinates\tLSU_coordinates\tmean_depth\ttaxonomy_status\tconsensus_taxonomy\n' \
+        > "$OUTDIR/final/master_summary.tsv"
+    cp -- "$OUTDIR/final/master_summary.tsv" "$OUTDIR/final/partials.tsv"
     : > "$OUTDIR/final/reconstructed_graph_loci.fasta"
+    : > "$OUTDIR/final/reported_loci.fasta"
     : > "$OUTDIR/final/complete_rDNA_loci.fasta"
-    printf 'path_id\tpromoted_locus\tlength_bp\tnode_count\tjunction_count\tsupported_junctions\tminimum_junction_spanning_templates\tSSU_phylum\tITS_phylum\tLSU_phylum\tSSU_taxonomy\tLSU_taxonomy\tpath_status\tconsensus_taxonomy\treason\n' \
+    : > "$OUTDIR/final/taxonomic_chimeras.fasta"
+    printf 'sequence_id\tsource\tlength_bp\tconflict_rank\tSSU_taxonomy\tLSU_taxonomy\n' \
+        > "$OUTDIR/final/taxonomic_chimeras.tsv"
+    printf 'path_id\tpromoted_locus\tlength_bp\tnode_count\tjunction_count\tsupported_junctions\tminimum_junction_spanning_templates\tSSU_phylum\tITS_phylum\tLSU_phylum\tSSU_taxonomy\tLSU_taxonomy\tpath_status\tconsensus_taxonomy\treason\tconflict_rank\n' \
         > "$OUTDIR/final/graph_locus_validation.tsv"
     printf 'locus\tsource_path\tnode_path\tpath_status\n' \
         > "$OUTDIR/final/locus_source_map.tsv"
-    : > "$OUTDIR/master_summary.csv"
+    printf 'contig,locus_type,length_bp,SSU_coordinates,ITS1_coordinates,5.8S_coordinates,ITS2_coordinates,LSU_coordinates,mean_depth,taxonomy_status,consensus_taxonomy\n' \
+        > "$OUTDIR/master_summary.csv"
+    cp -- "$OUTDIR/master_summary.csv" "$OUTDIR/partials.csv"
 fi
 
 for graph in assembly_graph.fastg assembly_graph_with_scaffolds.gfa assembly_graph.gfa; do
@@ -3504,6 +3595,7 @@ read -r CANDIDATE_COUNT CANDIDATE_BP < <(fasta_stats "$CANDIDATE_CONTIGS")
 read -r COMPLETE_ITS_COUNT COMPLETE_ITS_BP < <(fasta_stats "$OUTDIR/final/complete_ITS.fasta")
 read -r COMPLETE_LOCUS_COUNT COMPLETE_LOCUS_BP < <(fasta_stats "$OUTDIR/final/complete_rDNA_loci.fasta")
 read -r PROMOTED_GRAPH_COUNT PROMOTED_GRAPH_BP < <(fasta_stats "$OUTDIR/final/reconstructed_graph_loci.fasta")
+read -r REPORTED_LOCUS_COUNT REPORTED_LOCUS_BP < <(fasta_stats "$OUTDIR/final/reported_loci.fasta")
 if [[ -s "$OUTDIR/validation/graph_paths/graph_candidate_paths.fasta" ]]; then
     read -r GRAPH_PATH_COUNT GRAPH_PATH_BP < <(
         fasta_stats "$OUTDIR/validation/graph_paths/graph_candidate_paths.fasta")
@@ -3513,12 +3605,13 @@ else
 fi
 read -r PARTIAL_LOCUS_COUNT PARTIAL_LOCUS_BP < <(fasta_stats "$OUTDIR/final/partial_locus_contigs.fasta")
 VARIANT_COUNT=$(awk 'END { print (NR > 0 ? NR - 1 : 0) }' "$OUTDIR/final/residual_variants.tsv")
+PARTIAL_REPORT_COUNT=$(awk 'END { print (NR > 0 ? NR - 1 : 0) }' "$OUTDIR/partials.csv")
 # Report taxonomy counts for the concise biological output, not for rejected
 # internal path candidates retained beneath validation/.
 COHERENT_TAXONOMY_COUNT=$(awk -F ',' 'NR > 1 && ($10 == "PASS_taxonomically_coherent" || $10 == "PARTIAL_taxonomically_assigned") { n++ } END { print n + 0 }' \
     "$OUTDIR/master_summary.csv")
-TAXONOMIC_CHIMERA_COUNT=$(awk -F ',' 'NR > 1 && $10 == "CHIMERA" { n++ } END { print n + 0 }' \
-    "$OUTDIR/master_summary.csv")
+TAXONOMIC_CHIMERA_COUNT=$(awk 'END { print (NR > 0 ? NR - 1 : 0) }' \
+    "$OUTDIR/final/taxonomic_chimeras.tsv")
 UNRESOLVED_TAXONOMY_COUNT=$(awk -F ',' 'NR > 1 && $10 == "UNRESOLVED" { n++ } END { print n + 0 }' \
     "$OUTDIR/master_summary.csv")
 GRAPH_CHIMERA_COUNT=$(awk -F '\t' 'NR > 1 && $13 == "CHIMERA" { n++ } END { print n + 0 }' \
@@ -3584,11 +3677,14 @@ printf '%s\n' \
     "Complete ITS bp: $COMPLETE_ITS_BP" \
     "Complete native and reconstructed rDNA loci: $COMPLETE_LOCUS_COUNT" \
     "Complete native and reconstructed rDNA bp: $COMPLETE_LOCUS_BP" \
+    "Nonchimeric reported loci: $REPORTED_LOCUS_COUNT" \
+    "Nonchimeric reported locus bp: $REPORTED_LOCUS_BP" \
     "Partial or ambiguous loci retained: $PARTIAL_LOCUS_COUNT" \
     "Partial or ambiguous locus bp: $PARTIAL_LOCUS_BP" \
+    "Incomplete candidates reported in partials.csv: $PARTIAL_REPORT_COUNT" \
     "Residual unphased variants: $VARIANT_COUNT" \
     "Taxonomically coherent or assigned loci: $COHERENT_TAXONOMY_COUNT" \
-    "Chimeric loci: $TAXONOMIC_CHIMERA_COUNT" \
+    "Upper-rank chimeras excluded and retained separately: $TAXONOMIC_CHIMERA_COUNT" \
     "Unresolved-taxonomy loci: $UNRESOLVED_TAXONOMY_COUNT" \
     "NCBI targeted BLAST enabled: $RUN_NCBI_BLAST" \
     "NCBI BLAST database directory: ${NCBI_DB_DIR:-NA}" \
@@ -3608,7 +3704,10 @@ if [[ "$GRAPH_PATHS" == true ]]; then
 fi
 log "Dual-anchor contigs: $DUAL_CONTIGS"
 log "Oriented validated contigs: $OUTDIR/final/oriented_dual_anchor_contigs.fasta"
+log "Nonchimeric loci matching the master summary: $OUTDIR/final/reported_loci.fasta"
 log "Complete native and reconstructed rDNA loci: $OUTDIR/final/complete_rDNA_loci.fasta"
+log "Upper-rank taxonomic chimeras: $OUTDIR/final/taxonomic_chimeras.fasta"
+log "Chimera component assignments: $OUTDIR/final/taxonomic_chimeras.tsv"
 log "Complete ITS regions: $OUTDIR/final/complete_ITS.fasta"
 log "Validation report: $OUTDIR/final/contig_validation.tsv"
 log "Contig support: $OUTDIR/final/contig_support.tsv"
@@ -3618,6 +3717,8 @@ log "Taxonomy validation: $OUTDIR/final/taxonomy_validation.tsv"
 log "Integrated locus summary: $OUTDIR/final/rrna_locus_summary.tsv"
 log "Master summary: $OUTDIR/final/master_summary.tsv"
 log "Master summary CSV: $OUTDIR/master_summary.csv"
+log "Incomplete-locus summary: $OUTDIR/final/partials.tsv"
+log "Incomplete-locus summary CSV: $OUTDIR/partials.csv"
 log "Recruitment history: $METRICS"
 log "Recruitment graph checks: $GRAPH_METRICS"
 log "Total analysis time: $ELAPSED (HH:MM:SS)"

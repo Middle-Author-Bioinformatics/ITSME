@@ -19,14 +19,15 @@ flowchart LR
     D --> E[Validated rDNA loci]
 ```
 
-Native SPAdes `NODE_...` contigs are always retained. ITSME also enumerates
-bounded paths through the assembly graph, but promotes a path as an
-`ITSME_LOCUS_...` only when it has the expected SSU–ITS1–5.8S–ITS2–LSU
-structure, every graph junction has read-template support, and independent SSU
-and LSU classifications agree at least at phylum. ITS classification is
-secondary evidence: agreement strengthens a result, absence does not reject it,
-and conflict is reported as a warning. All unpromoted paths remain available in
-`validation/graph_paths/` for audit.
+Native SPAdes `NODE_...` contigs are retained when they meet the default 150-bp
+reporting minimum. ITSME also enumerates bounded assembly-graph paths and
+promotes them as `ITSME_LOCUS_...` sequences when they have the expected
+SSU–ITS1–5.8S–ITS2–LSU structure, supported graph junctions, and concordant SSU
+and LSU taxonomy. When several reconstructed paths have the same most-resolved
+consensus taxonomy, only the longest is reported as the representative. Every
+original path remains in `validation/graph_paths/` for audit. SSU/LSU conflicts
+at domain, kingdom, or phylum are excluded from the master summary and reported
+FASTA, but retained with both assignments in dedicated chimera files.
 
 ## Install
 
@@ -68,13 +69,12 @@ Run one library with the balanced sensitivity preset:
     -2 sample_R2_001.fastq.gz \
     -o itsme_sample \
     --db-dir /home/ark/databases/itsme_db \
-    --expected-taxonomy Echinodermata \
     --sensitivity 2
 ```
 
 `--sensitivity` accepts `1` (specific), `2` (balanced; default), or `3`
-(sensitive). `--expected-taxonomy` labels results but never removes non-target
-sequences.
+(sensitive). The minimum reported full contig or reconstructed locus is 150 bp;
+change it with `--min-report-length`. Individual ITS subregions may be shorter.
 
 Run all paired libraries in a directory:
 
@@ -83,7 +83,6 @@ Run all paired libraries in a directory:
     -i /path/to/fastqs \
     -o /path/to/results \
     --db-dir /home/ark/databases/itsme_db \
-    --expected-taxonomy Echinodermata \
     --sensitivity 2 \
     --resume
 ```
@@ -94,12 +93,17 @@ No `--` separator is required before ITSME options.
 
 | File | Contents |
 | --- | --- |
-| `master_summary.csv` | Concise native-contig and promoted-locus summary with region coordinates and consensus taxonomy |
-| `final/complete_rDNA_loci.fasta` | Complete validated native and reconstructed rDNA loci |
-| `final/reconstructed_graph_loci.fasta` | Graph paths promoted after structural, junction-support, and taxonomy checks |
-| `final/graph_locus_validation.tsv` | Decision and reason for every bounded graph path |
+| `master_summary.csv` | Complete nonchimeric ITS-containing loci with region coordinates and consensus taxonomy |
+| `partials.csv` | Incomplete 18S/28S and other seed-anchored candidates without a validated complete ITS cassette |
+| `final/reported_loci.fasta` | Complete sequences corresponding one-for-one to the master-summary rows, with annotated region coordinates |
+| `final/complete_rDNA_loci.fasta` | Complete nonchimeric native and reconstructed rDNA loci |
+| `final/reconstructed_graph_loci.fasta` | Longest representative of each concordant reconstructed taxonomic group |
+| `final/taxonomic_chimeras.fasta` | Structurally recovered loci excluded for SSU/LSU disagreement at phylum or above |
+| `final/taxonomic_chimeras.tsv` | Conflict rank and separate SSU/LSU assignments for excluded chimeras |
+| `final/graph_locus_validation.tsv` | Decision, SSU/LSU taxonomy, and representative mapping for every bounded graph path |
 | `final/partial_locus_contigs.fasta` | Native partial 18S/28S contigs retained from the assembly |
 | `validation/graph_paths/graph_candidate_paths.fasta` | Every bounded path before promotion filtering |
+| `validation/graph_paths/collapsed_same_taxonomy_paths.fasta` | Redundant reconstructed paths omitted in favor of the longest taxonomic representative |
 | `run_summary.txt` | Run settings, counts, stopping reason, and elapsed time |
 
 Use `./itsme.sh --help` and `./itsme_controller.sh --help` for all options.
