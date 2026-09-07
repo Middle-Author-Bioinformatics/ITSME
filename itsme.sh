@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# ITSME v1: variant-aware eukaryotic rDNA recruitment, assembly, and classification
+# ITSME v1.7: variant-aware eukaryotic rDNA recruitment, assembly, and classification
 #
 # Recruit eukaryotic rRNA reads with a GetOrganelle-like workflow:
 #   1. Map raw reads once to one or more full-length rRNA seed databases.
@@ -10,7 +10,8 @@
 #   5. Reject abnormal recruitment before it can enter the assembly.
 #   6. Assemble the final accepted pool once with SPAdes.
 #   7. Enumerate bounded 18S-to-28S graph paths and measure junction support.
-#   8. Promote only structurally valid, read-supported, taxonomically coherent paths.
+#   8. Promote the longest representative of each structurally valid,
+#      read-supported, taxonomically coherent path group.
 #   9. Retain native SPAdes contigs and every candidate path as audit evidence.
 #
 # This is not GetOrganelle. Short reads cannot prove long-range phase across
@@ -21,7 +22,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 SECONDS=0
 
-VERSION="1.6.0"
+VERSION="1.7.0"
 
 READS_1=""
 READS_2=""
@@ -58,6 +59,7 @@ KMERS="auto"
 POST_MAP_QC=true
 QC_QUALITY=20
 MIN_READ_LENGTH=50
+MIN_REPORT_LENGTH=150
 FLASH_MIN_OVERLAP=10
 FLASH_MAX_OVERLAP=150
 FLASH_MISMATCH_DENSITY=0.25
@@ -80,6 +82,8 @@ NCBI_MAX_HITS=50
 NCBI_REPORT_HITS=10
 TAXDUMP_DIR="${NCBI_TAXDUMP_DIR:-}"
 TAXDUMP_DIR_EXPLICIT=false
+# Retained only so older commands do not fail. Expected taxonomy never changes
+# recruitment, assembly, taxonomy, or reporting in v1.7.0.
 EXPECTED_TAXONOMY=""
 TAXONOMY_NEAR_TOP_FRACTION=0.95
 GRAPH_PATHS=true
@@ -110,7 +114,7 @@ ASSEMBLY_SINGLE_FILES=()
 
 usage() {
     cat <<'EOF'
-ITSME v1.6.0 - graph-aware eukaryotic rDNA recruitment and classification
+ITSME v1.7.0 - graph-aware eukaryotic rDNA recruitment and classification
 
 Usage:
   itsme.sh -1 R1.fastq.gz -2 R2.fastq.gz \
@@ -178,6 +182,8 @@ Post-mapping QC (enabled by default):
       --skip-post-qc               Do not trim or merge recruited reads
       --qc-quality INT             Trimmomatic sliding-window quality [20]
       --min-read-length INT        Minimum retained read length [50]
+      --min-report-length INT      Minimum full contig/locus length reported
+                                   in biological outputs [150]
       --adapters FILE              Adapter FASTA; otherwise auto-detected
       --adapter-clip PARAMS        ILLUMINACLIP parameters [2:30:10]
       --trimmomatic CMD            Trimmomatic executable [trimmomatic]
@@ -225,8 +231,8 @@ Assembly and output:
                                    BLAST databases [auto-detected from --db-dir]
       --ncbi-max-hits INT         Maximum BLAST hits retained per query [50]
       --ncbi-report-hits INT      Top hits per locus in summary table [10]
-      --expected-taxonomy NAME    Expected clade at any rank, e.g.
-                                   Echinodermata; flags but never removes loci
+      --expected-taxonomy NAME    Deprecated compatibility option; accepted
+                                   but ignored
       --ncbi-taxdump-dir DIR      NCBI taxdump directory containing nodes.dmp,
                                    names.dmp and optionally merged.dmp
                                    [auto-detected from --db-dir]
@@ -242,6 +248,7 @@ Principal outputs:
   OUTPUT/final/complete_rDNA_loci.fasta
   OUTPUT/final/graph_locus_validation.tsv
   OUTPUT/final/locus_source_map.tsv
+  OUTPUT/validation/graph_paths/collapsed_same_taxonomy_paths.fasta
   OUTPUT/final/partial_18S_contigs.fasta
   OUTPUT/final/partial_28S_contigs.fasta
   OUTPUT/final/rrna_dual_anchor_contigs.fasta
@@ -294,9 +301,11 @@ Notes:
     ceiling. Checkpoint SPAdes uses one k-mer; the full multi-k SPAdes assembly
     is run once after recruitment stops.
   * All bounded 18S-to-28S graph paths are retained under validation/graph_paths/.
-    A path is promoted to a reconstructed locus only when every graph junction
-    has sufficient read-template support and SSU and LSU agree at phylum or
-    deeper. Native NODE_ contigs remain the underlying assembly evidence.
+    A path is eligible for promotion only when every graph junction has
+    sufficient read-template support and SSU and LSU agree at phylum or deeper.
+    Eligible paths with the same most-resolved consensus taxonomy are collapsed
+    to the longest representative in final outputs. Native NODE_ contigs remain
+    the underlying assembly evidence.
   * Dual-anchor contigs are validated for non-overlapping, consistently
     oriented 18S and 28S anchors and automatically oriented 18S-to-28S.
   * ITSx runs only on oriented contigs, avoiding reverse-orientation artifacts.
@@ -304,7 +313,8 @@ Notes:
     ITS_eukaryote_sequences and LSU_eukaryote_rRNA databases. SSU and LSU
     determine the primary whole-locus taxonomy; ITS is independent secondary
     evidence and does not reject an otherwise coherent path when unresolved.
-  * Complete and partial native contigs are retained regardless of taxon.
+  * Complete and partial native contigs are retained regardless of taxon when
+    they meet --min-report-length [150 bp].
     Residual VCF records remain unphased.
 EOF
 }
@@ -529,6 +539,8 @@ while [[ $# -gt 0 ]]; do
             need_value "$@"; QC_QUALITY="$2"; shift 2 ;;
         --min-read-length)
             need_value "$@"; MIN_READ_LENGTH="$2"; shift 2 ;;
+        --min-report-length)
+            need_value "$@"; MIN_REPORT_LENGTH="$2"; shift 2 ;;
         --adapters)
             need_value "$@"; ADAPTERS="$2"; shift 2 ;;
         --adapter-clip)
@@ -629,6 +641,9 @@ done
 [[ -n "$READS_1" ]] || die "Missing -1/--reads1."
 [[ -n "$READS_2" ]] || die "Missing -2/--reads2."
 [[ -n "$OUTDIR" ]] || die "Missing -o/--output-dir."
+if [[ -n "$EXPECTED_TAXONOMY" ]]; then
+    log "WARNING: --expected-taxonomy is deprecated and ignored; taxonomy is reported without a target prior."
+fi
 
 if [[ -n "$DB_DIR" ]]; then
     [[ -d "$DB_DIR" ]] || die "rRNA database directory not found: $DB_DIR"
@@ -714,6 +729,7 @@ is_positive_int "$INWARD_END_LENGTH" || die "--inward-end-length must be a posit
 is_nonnegative_int "$MIN_NEW_TEMPLATES" || die "--min-new-templates must be nonnegative."
 is_positive_int "$MAX_INSERT" || die "--max-insert must be a positive integer."
 is_positive_int "$MIN_READ_LENGTH" || die "--min-read-length must be a positive integer."
+is_positive_int "$MIN_REPORT_LENGTH" || die "--min-report-length must be a positive integer."
 is_nonnegative_int "$QC_QUALITY" || die "--qc-quality must be nonnegative."
 is_positive_int "$FLASH_MIN_OVERLAP" || die "--flash-min-overlap must be positive."
 is_positive_int "$FLASH_MAX_OVERLAP" || die "--flash-max-overlap must be positive."
@@ -1572,6 +1588,39 @@ extract_fasta_by_names() {
     ' "$names" "$input" > "$output"
 }
 
+filter_fasta_min_length() {
+    local input="$1"
+    local output="$2"
+    local minimum="$3"
+    python3 - "$input" "$output" "$minimum" <<'PY'
+import sys
+from pathlib import Path
+
+source, destination, minimum = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
+name, sequence = None, []
+
+def emit(handle, header, parts):
+    if header is None:
+        return
+    assembled = ''.join(parts)
+    if len(assembled) < minimum:
+        return
+    handle.write(f'>{header}\n')
+    for start in range(0, len(assembled), 80):
+        handle.write(assembled[start:start + 80] + '\n')
+
+with source.open() as incoming, destination.open('w') as outgoing:
+    for line in incoming:
+        line = line.rstrip('\n')
+        if line.startswith('>'):
+            emit(outgoing, name, sequence)
+            name, sequence = line[1:], []
+        elif name is not None:
+            sequence.append(line.strip())
+    emit(outgoing, name, sequence)
+PY
+}
+
 fasta_stats() {
     awk '
         /^>/ { sequences++; next }
@@ -2423,7 +2472,8 @@ PY
 
 build_locus_summary() {
     python3 - "$OUTDIR/final" "$EXPECTED_TAXONOMY" \
-        "$TAXONOMY_NEAR_TOP_FRACTION" "$MIN_JUNCTION_READS" <<'PY'
+        "$TAXONOMY_NEAR_TOP_FRACTION" "$MIN_JUNCTION_READS" \
+        "$MIN_REPORT_LENGTH" <<'PY'
 import csv, re, sys
 from pathlib import Path
 
@@ -2431,6 +2481,7 @@ root = Path(sys.argv[1])
 expected = sys.argv[2].strip()
 near_top_fraction = float(sys.argv[3])
 min_junction_reads = int(sys.argv[4])
+min_report_length = int(sys.argv[5])
 ranks = ('domain','kingdom','phylum','class','order','family','genus','species')
 
 def rows(path):
@@ -2539,39 +2590,30 @@ def taxonomy_result(contig, locus_type):
         marker = ssu if locus_type == 'PARTIAL_18S' else lsu
         marker_name = 'SSU' if locus_type == 'PARTIAL_18S' else 'LSU'
         if not resolved(marker.get('phylum', 'NA')):
-            status = 'PARTIAL_unresolved'
+            status = 'UNRESOLVED'
             note = f'{marker_name}-only locus was unresolved at phylum'
-        elif expected:
-            lineage_names = {value.casefold() for value in marker.values() if resolved(value)}
-            if expected.casefold() in lineage_names:
-                status = 'PARTIAL_expected_taxon'
-            else:
-                status = 'PARTIAL_non_target_taxon'
-                note = f'{marker_name}-only lineage does not contain expected taxon {expected}'
         else:
             status = 'PARTIAL_taxonomically_assigned'
     elif (resolved(ssu_phylum) and resolved(lsu_phylum) and
             ssu_phylum.casefold() != lsu_phylum.casefold()):
-        status = 'FAIL_taxonomic_chimera'
+        status = 'CHIMERA'
         note = f'SSU phylum {ssu_phylum} conflicts with LSU phylum {lsu_phylum}'
     elif not resolved(ssu_phylum) or not resolved(lsu_phylum):
         status = 'UNRESOLVED'
         note = 'SSU or LSU consensus was unresolved at phylum'
-    elif expected:
-        lineage_names = {value.casefold() for value in combined.values() if resolved(value)}
-        if expected.casefold() in lineage_names:
-            status = 'PASS_expected_taxon'
-        else:
-            status = 'PASS_non_target_taxon'
-            note = f'Consensus lineage does not contain expected taxon {expected}'
     else:
         status = 'PASS_taxonomically_coherent'
 
+    component_taxonomies = 'NA'
+    if status == 'CHIMERA':
+        component_taxonomies = (f'SSU={lineage_text(ssu)} | '
+                                f'LSU={lineage_text(lsu)}')
+
     return {
         'taxonomy_status': status,
-        'expected_taxonomy': expected or 'NA',
         **{f'consensus_{rank}': combined[rank] for rank in ranks},
         'consensus_taxonomy': lineage_text(combined),
+        'component_taxonomies': component_taxonomies,
         'SSU_consensus_taxonomy': lineage_text(ssu),
         'ITS_consensus_taxonomy': lineage_text(its),
         'LSU_consensus_taxonomy': lineage_text(lsu),
@@ -2581,9 +2623,9 @@ def taxonomy_result(contig, locus_type):
         'validation_note': note or 'NA'
     }
 
-taxonomy_fields = ['contig','locus_type','taxonomy_status','expected_taxonomy',
+taxonomy_fields = ['contig','locus_type','taxonomy_status',
                    *[f'consensus_{rank}' for rank in ranks],
-                   'consensus_taxonomy','SSU_consensus_taxonomy',
+                   'consensus_taxonomy','component_taxonomies','SSU_consensus_taxonomy',
                    'ITS_consensus_taxonomy','LSU_consensus_taxonomy',
                    'SSU_near_top_hits','ITS_near_top_hits','LSU_near_top_hits',
                    'validation_note']
@@ -2602,9 +2644,9 @@ detailed_fields = ['contig','contig_length','locus_type','source','orientation',
           'ITS2_coordinates','ITS2_bp','LSU_coordinates','LSU_bp',
           '18S_anchor_identity','28S_anchor_identity','readback_coverage_percent','readback_mean_depth',
           'readback_mean_mapq','unique_mapped_reads','unique_coverage_percent',
-          'unique_mean_depth','taxonomy_status','expected_taxonomy',
+          'unique_mean_depth','taxonomy_status',
           *[f'consensus_{rank}' for rank in ranks],
-          'consensus_taxonomy','SSU_consensus_taxonomy','ITS_consensus_taxonomy',
+          'consensus_taxonomy','component_taxonomies','SSU_consensus_taxonomy','ITS_consensus_taxonomy',
           'LSU_consensus_taxonomy','SSU_near_top_hits','ITS_near_top_hits',
           'LSU_near_top_hits','validation_note']
 for marker in ('SSU','ITS','LSU'):
@@ -2702,6 +2744,8 @@ for path_id in sorted(path_summary):
         'SSU_phylum': 'NA',
         'ITS_phylum': 'NA',
         'LSU_phylum': 'NA',
+        'SSU_taxonomy': 'NA',
+        'LSU_taxonomy': 'NA',
         'path_status': 'UNRESOLVED_PATH',
         'consensus_taxonomy': 'NA',
         'reason': 'path was not evaluated',
@@ -2715,6 +2759,11 @@ for path_id in sorted(path_summary):
     if path_id not in catalog:
         decision['path_status'] = 'FAIL_NOT_ANALYZED'
         decision['reason'] = 'path was absent from the analysis candidate set'
+        path_decisions[path_id] = decision
+        continue
+    if int(summary.get('length_bp', '0') or 0) < min_report_length:
+        decision['path_status'] = 'BELOW_REPORT_LENGTH'
+        decision['reason'] = f'path was shorter than {min_report_length} bp'
         path_decisions[path_id] = decision
         continue
 
@@ -2738,6 +2787,8 @@ for path_id in sorted(path_summary):
         'SSU_phylum': ssu_phylum,
         'ITS_phylum': its_phylum,
         'LSU_phylum': lsu_phylum,
+        'SSU_taxonomy': lineage_text(ssu),
+        'LSU_taxonomy': lineage_text(lsu),
         'consensus_taxonomy': taxonomy[path_id]['consensus_taxonomy'],
     })
 
@@ -2759,8 +2810,9 @@ for path_id in sorted(path_summary):
         decision['path_status'] = 'UNRESOLVED_PATH'
         decision['reason'] = 'SSU or LSU consensus was unresolved at phylum'
     elif ssu_phylum.casefold() != lsu_phylum.casefold():
-        decision['path_status'] = 'FAIL_CROSS_PHYLUM_CHIMERA'
-        decision['reason'] = f'SSU={ssu_phylum}; LSU={lsu_phylum}'
+        decision['path_status'] = 'CHIMERA'
+        decision['reason'] = (f'SSU={lineage_text(ssu)}; '
+                              f'LSU={lineage_text(lsu)}')
     else:
         lower_conflict = next((rank for rank in ('class','order','family','genus','species')
                                if resolved(ssu.get(rank, 'NA')) and
@@ -2783,14 +2835,43 @@ for path_id in sorted(path_summary):
         accepted_paths.append(path_id)
     path_decisions[path_id] = decision
 
+# Alternative graph paths with the same deepest SSU/LSU consensus are often
+# repeat/graph isoforms rather than independently identifiable taxa. Retain
+# every path in validation/, but report only the longest representative for
+# each resolved consensus lineage.
+taxonomy_groups = {}
+for path_id in accepted_paths:
+    consensus = taxonomy[path_id]['consensus_taxonomy']
+    key = consensus.casefold() if resolved(consensus) else f'__{path_id}'
+    taxonomy_groups.setdefault(key, []).append(path_id)
+
+representative_paths = []
+collapsed_to = {}
+for path_ids in taxonomy_groups.values():
+    representative = sorted(
+        path_ids,
+        key=lambda path_id: (-int(path_summary[path_id].get('length_bp', '0') or 0),
+                             path_id),
+    )[0]
+    representative_paths.append(representative)
+    for path_id in path_ids:
+        if path_id != representative:
+            collapsed_to[path_id] = representative
+
+accepted_paths = sorted(representative_paths)
 promoted = {path_id: f'ITSME_LOCUS_{number:06d}'
             for number, path_id in enumerate(accepted_paths, 1)}
 for path_id, promoted_id in promoted.items():
     path_decisions[path_id]['promoted_locus'] = promoted_id
+for path_id, representative in collapsed_to.items():
+    path_decisions[path_id]['promoted_locus'] = promoted[representative]
+    path_decisions[path_id]['path_status'] = 'COLLAPSED_SAME_TAXONOMY'
+    path_decisions[path_id]['reason'] = (
+        f'same consensus taxonomy as {representative}; longest path retained')
 
 path_fields = ['path_id','promoted_locus','length_bp','node_count','junction_count',
                'supported_junctions','minimum_junction_spanning_templates',
-               'SSU_phylum','ITS_phylum','LSU_phylum','path_status',
+               'SSU_phylum','ITS_phylum','LSU_phylum','SSU_taxonomy','LSU_taxonomy','path_status',
                'consensus_taxonomy','reason']
 with (root / 'graph_locus_validation.tsv').open('w', newline='') as handle:
     writer = csv.DictWriter(handle, fieldnames=path_fields, delimiter='\t', lineterminator='\n')
@@ -2802,8 +2883,9 @@ with (root / 'locus_source_map.tsv').open('w', newline='') as handle:
     fields = ['locus','source_path','node_path','path_status']
     writer = csv.DictWriter(handle, fieldnames=fields, delimiter='\t', lineterminator='\n')
     writer.writeheader()
-    for path_id in accepted_paths:
-        writer.writerow({'locus': promoted[path_id], 'source_path': path_id,
+    for path_id in sorted(set(accepted_paths) | set(collapsed_to)):
+        representative = collapsed_to.get(path_id, path_id)
+        writer.writerow({'locus': promoted[representative], 'source_path': path_id,
                          'node_path': path_summary[path_id].get('node_path', 'NA'),
                          'path_status': path_decisions[path_id]['path_status']})
 
@@ -2820,12 +2902,22 @@ write_fasta(root / 'reconstructed_graph_loci.fasta', reconstructed_entries)
 
 rejected_entries = []
 for path_id in sorted(path_summary):
-    if path_id in promoted or path_id not in raw_path_records:
+    if path_id in promoted or path_id in collapsed_to or path_id not in raw_path_records:
         continue
     _, sequence = raw_path_records[path_id]
     rejected_entries.append((
         f'{path_id} path_status={path_decisions[path_id]["path_status"]}', sequence))
 write_fasta(graph_dir / 'rejected_graph_paths.fasta', rejected_entries)
+
+collapsed_entries = []
+for path_id, representative in sorted(collapsed_to.items()):
+    if path_id not in raw_path_records:
+        continue
+    _, sequence = raw_path_records[path_id]
+    collapsed_entries.append((
+        f'{path_id} representative={promoted[representative]} '
+        f'path_status=COLLAPSED_SAME_TAXONOMY', sequence))
+write_fasta(graph_dir / 'collapsed_same_taxonomy_paths.fasta', collapsed_entries)
 
 # Retain the unfiltered oriented analysis set for complete auditability, then
 # make the final FASTA contain native assemblies plus promoted graph loci only.
@@ -2879,11 +2971,13 @@ for filename in ('complete_ITS.fasta','ITS1.fasta','5_8S.fasta','ITS2.fasta'):
 master_fields = ['contig','locus_type','length_bp','SSU_coordinates',
                  'ITS1_coordinates','5.8S_coordinates','ITS2_coordinates',
                  'LSU_coordinates','mean_depth','taxonomy_status',
-                 'consensus_taxonomy']
+                 'consensus_taxonomy','component_taxonomies']
 master_rows = []
 for contig in sorted(catalog):
     x, c, tax = itsx.get(contig, {}), coverage.get(contig, {}), taxonomy[contig]
     candidate = catalog[contig]
+    if int(candidate.get('length_bp', '0') or 0) < min_report_length:
+        continue
     source = candidate.get('source', 'NA')
     if source == 'graph_path' and contig not in promoted:
         continue
@@ -2911,7 +3005,8 @@ for contig in sorted(catalog):
         'LSU_coordinates': coordinates['LSU'],
         'mean_depth': c.get('meandepth',header_depth),
         'taxonomy_status': tax['taxonomy_status'],
-        'consensus_taxonomy': tax['consensus_taxonomy']
+        'consensus_taxonomy': tax['consensus_taxonomy'],
+        'component_taxonomies': tax['component_taxonomies']
     })
 
 with (root / 'master_summary.tsv').open('w', newline='') as destination:
@@ -3296,6 +3391,14 @@ awk '{ print $1 }' "$OUTDIR/final/all_seed_anchor_hits.tsv" | LC_ALL=C sort -u \
     die "No final contig retained a direct seed hit."
 extract_fasta_by_names "$OUTDIR/final/rrna_candidate_contig_names.txt" \
     "$ALL_CONTIGS" "$CANDIDATE_CONTIGS"
+filter_fasta_min_length "$CANDIDATE_CONTIGS" \
+    "$OUTDIR/final/rrna_candidate_contigs.min_length.fasta" "$MIN_REPORT_LENGTH"
+mv -- "$OUTDIR/final/rrna_candidate_contigs.min_length.fasta" "$CANDIDATE_CONTIGS"
+awk '/^>/ { name=substr($0,2); sub(/[[:space:]].*$/, "", name); print name }' \
+    "$CANDIDATE_CONTIGS" > "$OUTDIR/final/rrna_candidate_contig_names.txt"
+if [[ ! -s "$CANDIDATE_CONTIGS" ]]; then
+    log "WARNING: no native seed-anchored contig met --min-report-length $MIN_REPORT_LENGTH; graph reconstruction will still be evaluated."
+fi
 
 : > "$DUAL_CONTIGS"
 DUAL_COUNT=0
@@ -3356,6 +3459,7 @@ else
     printf 'path_id\tjunction_count\tsupported_junctions\tminimum_junction_spanning_templates\tjunction_template_counts\n' \
         > "$OUTDIR/validation/graph_paths/junction_support.tsv"
     : > "$OUTDIR/validation/graph_paths/rejected_graph_paths.fasta"
+    : > "$OUTDIR/validation/graph_paths/collapsed_same_taxonomy_paths.fasta"
     cp -- "$CANDIDATE_CONTIGS" "$OUTDIR/validation/analysis_locus_candidates.fasta"
     printf 'contig\tsource\tsource_header\tlength_bp\n' \
         > "$OUTDIR/validation/locus_candidate_provenance.tsv"
@@ -3382,7 +3486,7 @@ else
     : > "$OUTDIR/final/master_summary.tsv"
     : > "$OUTDIR/final/reconstructed_graph_loci.fasta"
     : > "$OUTDIR/final/complete_rDNA_loci.fasta"
-    printf 'path_id\tpromoted_locus\tlength_bp\tnode_count\tjunction_count\tsupported_junctions\tminimum_junction_spanning_templates\tSSU_phylum\tITS_phylum\tLSU_phylum\tpath_status\tconsensus_taxonomy\treason\n' \
+    printf 'path_id\tpromoted_locus\tlength_bp\tnode_count\tjunction_count\tsupported_junctions\tminimum_junction_spanning_templates\tSSU_phylum\tITS_phylum\tLSU_phylum\tSSU_taxonomy\tLSU_taxonomy\tpath_status\tconsensus_taxonomy\treason\n' \
         > "$OUTDIR/final/graph_locus_validation.tsv"
     printf 'locus\tsource_path\tnode_path\tpath_status\n' \
         > "$OUTDIR/final/locus_source_map.tsv"
@@ -3411,21 +3515,19 @@ read -r PARTIAL_LOCUS_COUNT PARTIAL_LOCUS_BP < <(fasta_stats "$OUTDIR/final/part
 VARIANT_COUNT=$(awk 'END { print (NR > 0 ? NR - 1 : 0) }' "$OUTDIR/final/residual_variants.tsv")
 # Report taxonomy counts for the concise biological output, not for rejected
 # internal path candidates retained beneath validation/.
-EXPECTED_PASS_COUNT=$(awk -F ',' 'NR > 1 && ($10 == "PASS_expected_taxon" || $10 == "PARTIAL_expected_taxon") { n++ } END { print n + 0 }' \
-    "$OUTDIR/master_summary.csv")
-NON_TARGET_COUNT=$(awk -F ',' 'NR > 1 && ($10 == "PASS_non_target_taxon" || $10 == "PARTIAL_non_target_taxon") { n++ } END { print n + 0 }' \
-    "$OUTDIR/master_summary.csv")
 COHERENT_TAXONOMY_COUNT=$(awk -F ',' 'NR > 1 && ($10 == "PASS_taxonomically_coherent" || $10 == "PARTIAL_taxonomically_assigned") { n++ } END { print n + 0 }' \
     "$OUTDIR/master_summary.csv")
-TAXONOMIC_CHIMERA_COUNT=$(awk -F ',' 'NR > 1 && $10 == "FAIL_taxonomic_chimera" { n++ } END { print n + 0 }' \
+TAXONOMIC_CHIMERA_COUNT=$(awk -F ',' 'NR > 1 && $10 == "CHIMERA" { n++ } END { print n + 0 }' \
     "$OUTDIR/master_summary.csv")
-UNRESOLVED_TAXONOMY_COUNT=$(awk -F ',' 'NR > 1 && ($10 == "UNRESOLVED" || $10 == "PARTIAL_unresolved") { n++ } END { print n + 0 }' \
+UNRESOLVED_TAXONOMY_COUNT=$(awk -F ',' 'NR > 1 && $10 == "UNRESOLVED" { n++ } END { print n + 0 }' \
     "$OUTDIR/master_summary.csv")
-GRAPH_CHIMERA_COUNT=$(awk -F '\t' 'NR > 1 && $11 == "FAIL_CROSS_PHYLUM_CHIMERA" { n++ } END { print n + 0 }' \
+GRAPH_CHIMERA_COUNT=$(awk -F '\t' 'NR > 1 && $13 == "CHIMERA" { n++ } END { print n + 0 }' \
     "$OUTDIR/final/graph_locus_validation.tsv")
-GRAPH_UNRESOLVED_COUNT=$(awk -F '\t' 'NR > 1 && $11 == "UNRESOLVED_PATH" { n++ } END { print n + 0 }' \
+GRAPH_UNRESOLVED_COUNT=$(awk -F '\t' 'NR > 1 && $13 == "UNRESOLVED_PATH" { n++ } END { print n + 0 }' \
     "$OUTDIR/final/graph_locus_validation.tsv")
-GRAPH_UNSUPPORTED_COUNT=$(awk -F '\t' 'NR > 1 && ($11 == "FAIL_UNSUPPORTED_JUNCTION" || $11 == "FAIL_NO_JUNCTION_READBACK") { n++ } END { print n + 0 }' \
+GRAPH_UNSUPPORTED_COUNT=$(awk -F '\t' 'NR > 1 && ($13 == "FAIL_UNSUPPORTED_JUNCTION" || $13 == "FAIL_NO_JUNCTION_READBACK") { n++ } END { print n + 0 }' \
+    "$OUTDIR/final/graph_locus_validation.tsv")
+GRAPH_COLLAPSED_COUNT=$(awk -F '\t' 'NR > 1 && $13 == "COLLAPSED_SAME_TAXONOMY" { n++ } END { print n + 0 }' \
     "$OUTDIR/final/graph_locus_validation.tsv")
 FINAL_PAIR_COUNT=$(fastq_count "$FINAL_R1")
 FINAL_SINGLE_COUNT=$(fastq_count "$FINAL_SINGLE")
@@ -3461,6 +3563,7 @@ printf '%s\n' \
     "Outward new-template ceiling: $MAX_OUTWARD_TEMPLATES" \
     "Word size: $WORD_SIZE" \
     "Minimum word hits: $MIN_WORD_HITS" \
+    "Minimum reported locus length: $MIN_REPORT_LENGTH" \
     "All assembled contigs: $ALL_CONTIG_COUNT" \
     "All assembled bp: $ALL_BP" \
     "Seed-anchored candidate contigs: $CANDIDATE_COUNT" \
@@ -3469,7 +3572,8 @@ printf '%s\n' \
     "Bounded graph-path bp: $GRAPH_PATH_BP" \
     "Promoted reconstructed graph loci: $PROMOTED_GRAPH_COUNT" \
     "Promoted reconstructed graph-locus bp: $PROMOTED_GRAPH_BP" \
-    "Graph paths rejected as cross-phylum chimeras: $GRAPH_CHIMERA_COUNT" \
+    "Graph paths collapsed by consensus taxonomy: $GRAPH_COLLAPSED_COUNT" \
+    "Graph paths classified as chimeras: $GRAPH_CHIMERA_COUNT" \
     "Graph paths unresolved at phylum: $GRAPH_UNRESOLVED_COUNT" \
     "Graph paths rejected for junction support: $GRAPH_UNSUPPORTED_COUNT" \
     "Minimum templates per graph junction: $MIN_JUNCTION_READS" \
@@ -3483,11 +3587,8 @@ printf '%s\n' \
     "Partial or ambiguous loci retained: $PARTIAL_LOCUS_COUNT" \
     "Partial or ambiguous locus bp: $PARTIAL_LOCUS_BP" \
     "Residual unphased variants: $VARIANT_COUNT" \
-    "Expected taxonomy: ${EXPECTED_TAXONOMY:-NA}" \
-    "Expected-taxonomy loci: $EXPECTED_PASS_COUNT" \
-    "Non-target loci: $NON_TARGET_COUNT" \
-    "Taxonomically coherent loci without an expected-clade test: $COHERENT_TAXONOMY_COUNT" \
-    "Taxonomic-chimera loci: $TAXONOMIC_CHIMERA_COUNT" \
+    "Taxonomically coherent or assigned loci: $COHERENT_TAXONOMY_COUNT" \
+    "Chimeric loci: $TAXONOMIC_CHIMERA_COUNT" \
     "Unresolved-taxonomy loci: $UNRESOLVED_TAXONOMY_COUNT" \
     "NCBI targeted BLAST enabled: $RUN_NCBI_BLAST" \
     "NCBI BLAST database directory: ${NCBI_DB_DIR:-NA}" \
