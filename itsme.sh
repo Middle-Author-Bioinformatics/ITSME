@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 
-# ITSME v1.7: variant-aware eukaryotic rDNA recruitment, assembly, and classification
+# ITSME v1.8: taxon-binned eukaryotic rDNA recruitment, assembly, and classification
 #
 # Recruit eukaryotic rRNA reads with a GetOrganelle-like workflow:
 #   1. Map raw reads once to one or more full-length rRNA seed databases.
 #   2. Retain strong seed hits and their mates.
 #   3. QC only recruited reads.
-#   4. Extend inward and conservatively outward with frontier-only exact k-mers.
-#   5. Reject abnormal recruitment before it can enter the assembly.
-#   6. Assemble the final accepted pool once with SPAdes.
-#   7. Enumerate bounded 18S-to-28S graph paths and measure junction support.
-#   8. Promote the longest representative of each structurally valid,
+#   4. Classify seed-hit references and partition templates into provisional
+#      taxonomic bins, plus an optional expected-taxon rescue bin.
+#   5. Extend inward and conservatively outward within each bin independently.
+#   6. Assemble both the pooled fallback and each selected taxonomic bin.
+#   7. Enumerate bounded 18S-to-28S paths in every smaller graph.
+#   8. Reject abnormal recruitment before it can enter an assembly.
+#   9. Promote the longest representative of each structurally valid,
 #      read-supported, taxonomically coherent path group.
-#   9. Retain native SPAdes contigs and every candidate path as audit evidence.
+#  10. Retain native SPAdes contigs and every candidate path as audit evidence.
 #
 # This is not GetOrganelle. Short reads cannot prove long-range phase across
 # every rDNA repeat variant. Graph-derived loci are therefore promoted only
@@ -22,7 +24,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 SECONDS=0
 
-VERSION="1.7.2"
+VERSION="1.8.0"
 
 READS_1=""
 READS_2=""
@@ -82,10 +84,14 @@ NCBI_MAX_HITS=50
 NCBI_REPORT_HITS=10
 TAXDUMP_DIR="${NCBI_TAXDUMP_DIR:-}"
 TAXDUMP_DIR_EXPLICIT=false
-# Retained only so older commands do not fail. Expected taxonomy never changes
-# recruitment, assembly, taxonomy, or reporting in v1.7.2.
 EXPECTED_TAXONOMY=""
 TAXONOMY_NEAR_TOP_FRACTION=0.95
+TAXON_BINNING=true
+TAXON_BIN_RANK="phylum"
+MAX_TAXON_BINS=8
+MIN_TAXON_BIN_TEMPLATES=25
+MAX_TAXON_BIN_TEMPLATES=100000
+TAXON_BIN_MAX_ROUNDS=""
 GRAPH_PATHS=true
 MAX_GRAPH_PATHS=500
 MAX_GRAPH_NODES=40
@@ -111,10 +117,13 @@ RIGHT_DATABASES=()
 ASSEMBLY_R1_FILES=()
 ASSEMBLY_R2_FILES=()
 ASSEMBLY_SINGLE_FILES=()
+TAXON_BIN_R1_FILES=()
+TAXON_BIN_R2_FILES=()
+TAXON_BIN_SINGLE_FILES=()
 
 usage() {
     cat <<'EOF'
-ITSME v1.7.2 - graph-aware eukaryotic rDNA recruitment and classification
+ITSME v1.8.0 - taxon-binned, graph-aware eukaryotic rDNA reconstruction
 
 Usage:
   itsme.sh -1 R1.fastq.gz -2 R2.fastq.gz \
@@ -171,6 +180,21 @@ Recruitment:
       --min-growth FLOAT           Stop below this fractional growth [0.0001]
       --bbtools-memory SIZE        Java heap for BBDuk, e.g. 16g [16g]
       --bbduk CMD                  BBDuk executable [bbduk.sh]
+
+Taxonomic binning (enabled by default):
+      --taxon-bin-rank RANK       Provisional seed-template bins: phylum or
+                                   class [phylum]
+      --max-taxon-bins INT        Maximum ordinary taxonomic bins assembled;
+                                   0 selects all qualifying bins [8]
+      --min-taxon-bin-templates INT
+                                   Minimum seed templates required per bin [25]
+      --max-taxon-bin-templates INT
+                                   Per-bin accepted-template ceiling [100000]
+      --taxon-bin-max-rounds INT  Per-bin inward extension rounds
+                                   [same as --max-rounds]
+      --skip-taxon-binning        Run only the pooled fallback analysis
+      --expected-taxonomy NAME    Add a rescue bin from near-top seed-reference
+                                   hits matching NAME at any taxonomic rank
 
 Seed alignment:
       --seed-score-min FUNC        Bowtie2 local score minimum [G,20,8]
@@ -231,8 +255,6 @@ Assembly and output:
                                    BLAST databases [auto-detected from --db-dir]
       --ncbi-max-hits INT         Maximum BLAST hits retained per query [50]
       --ncbi-report-hits INT      Top hits per locus in summary table [10]
-      --expected-taxonomy NAME    Deprecated compatibility option; accepted
-                                   but ignored
       --ncbi-taxdump-dir DIR      NCBI taxdump directory containing nodes.dmp,
                                    names.dmp and optionally merged.dmp
                                    [auto-detected from --db-dir]
@@ -243,6 +265,10 @@ Assembly and output:
       --version                    Show the version
 
 Principal outputs:
+  OUTPUT/taxon_bins/bin_manifest.tsv
+  OUTPUT/taxon_bins/seed_reference_taxonomy.tsv
+  OUTPUT/taxon_bins/seed_template_bins.tsv
+  OUTPUT/taxon_bins/bin_summary.tsv
   OUTPUT/final/rrna_candidate_contigs.fasta
   OUTPUT/final/reconstructed_graph_loci.fasta
   OUTPUT/final/reported_loci.fasta
@@ -291,6 +317,13 @@ Conda installation:
 Notes:
   * Raw reads are mapped before QC. Trimmomatic and FLASH see only accepted
     rRNA-associated reads, not the full input library.
+  * Seed references actually hit by reads are classified against the local
+    NCBI SSU/LSU databases. Seed templates are divided into provisional
+    phylum- or class-level bins; each selected bin is extended and assembled
+    independently. The original pooled assembly is retained as a fallback.
+  * --expected-taxonomy creates an additional rescue bin from seed references
+    whose near-top classifications contain that taxon. It changes recovery
+    only; it does not alter final taxonomy labels or acceptance criteria.
   * --sensitivity 1, 2, and 3 select specific, balanced, and sensitive presets.
     Any explicitly supplied recruitment or graph option overrides its preset.
   * Up to three guarded inward rounds are enabled by default. Each round scans
@@ -530,6 +563,18 @@ while [[ $# -gt 0 ]]; do
             need_value "$@"; BBTOOLS_MEMORY="$2"; shift 2 ;;
         --bbduk)
             need_value "$@"; BBDUK_CMD="$2"; shift 2 ;;
+        --taxon-bin-rank)
+            need_value "$@"; TAXON_BIN_RANK="$2"; shift 2 ;;
+        --max-taxon-bins)
+            need_value "$@"; MAX_TAXON_BINS="$2"; shift 2 ;;
+        --min-taxon-bin-templates)
+            need_value "$@"; MIN_TAXON_BIN_TEMPLATES="$2"; shift 2 ;;
+        --max-taxon-bin-templates)
+            need_value "$@"; MAX_TAXON_BIN_TEMPLATES="$2"; shift 2 ;;
+        --taxon-bin-max-rounds)
+            need_value "$@"; TAXON_BIN_MAX_ROUNDS="$2"; shift 2 ;;
+        --skip-taxon-binning)
+            TAXON_BINNING=false; shift ;;
         --seed-score-min)
             need_value "$@"; SEED_SCORE_MIN="$2"; shift 2 ;;
         --min-read-aligned)
@@ -646,9 +691,7 @@ done
 [[ -n "$READS_1" ]] || die "Missing -1/--reads1."
 [[ -n "$READS_2" ]] || die "Missing -2/--reads2."
 [[ -n "$OUTDIR" ]] || die "Missing -o/--output-dir."
-if [[ -n "$EXPECTED_TAXONOMY" ]]; then
-    log "WARNING: --expected-taxonomy is deprecated and ignored; taxonomy is reported without a target prior."
-fi
+[[ -n "$TAXON_BIN_MAX_ROUNDS" ]] || TAXON_BIN_MAX_ROUNDS="$MAX_ROUNDS"
 
 if [[ -n "$DB_DIR" ]]; then
     [[ -d "$DB_DIR" ]] || die "rRNA database directory not found: $DB_DIR"
@@ -735,6 +778,15 @@ is_nonnegative_int "$MIN_NEW_TEMPLATES" || die "--min-new-templates must be nonn
 is_positive_int "$MAX_INSERT" || die "--max-insert must be a positive integer."
 is_positive_int "$MIN_READ_LENGTH" || die "--min-read-length must be a positive integer."
 is_positive_int "$MIN_REPORT_LENGTH" || die "--min-report-length must be a positive integer."
+[[ "$TAXON_BIN_RANK" == "phylum" || "$TAXON_BIN_RANK" == "class" ]] || \
+    die "--taxon-bin-rank must be phylum or class."
+is_nonnegative_int "$MAX_TAXON_BINS" || die "--max-taxon-bins must be nonnegative."
+is_positive_int "$MIN_TAXON_BIN_TEMPLATES" || \
+    die "--min-taxon-bin-templates must be positive."
+is_positive_int "$MAX_TAXON_BIN_TEMPLATES" || \
+    die "--max-taxon-bin-templates must be positive."
+is_nonnegative_int "$TAXON_BIN_MAX_ROUNDS" || \
+    die "--taxon-bin-max-rounds must be nonnegative."
 is_nonnegative_int "$QC_QUALITY" || die "--qc-quality must be nonnegative."
 is_positive_int "$FLASH_MIN_OVERLAP" || die "--flash-min-overlap must be positive."
 is_positive_int "$FLASH_MAX_OVERLAP" || die "--flash-max-overlap must be positive."
@@ -785,6 +837,10 @@ if [[ "$RUN_NCBI_BLAST" == true ]]; then
         blastdbcmd -db "$NCBI_DB_DIR/$database" -info >/dev/null 2>&1 || \
             die "Required NCBI BLAST database is unavailable: $NCBI_DB_DIR/$database"
     done
+fi
+if [[ "$TAXON_BINNING" == true && "$RUN_NCBI_BLAST" != true ]]; then
+    log "WARNING: taxonomic binning requires the targeted NCBI databases; disabling binning because --skip-ncbi-blast was supplied."
+    TAXON_BINNING=false
 fi
 is_number "$MAX_ROUND_GROWTH" || die "--max-round-growth must be nonnegative."
 is_number "$MAX_OUTWARD_GROWTH" || die "--max-outward-growth must be nonnegative."
@@ -875,6 +931,7 @@ else
     mkdir -p "$OUTDIR"
 fi
 mkdir -p "$OUTDIR/seed" "$OUTDIR/recruitment" "$OUTDIR/assembly" "$OUTDIR/final"
+mkdir -p "$OUTDIR/taxon_bins"
 
 COMBINED_DB="$OUTDIR/seed/combined_rrna_seeds.fasta"
 LEFT_DB="$OUTDIR/seed/left_18S_seeds.fasta"
@@ -886,6 +943,13 @@ SEED_BAM="$OUTDIR/seed/all_reads_to_seeds.bam"
 ACCEPTED_NAMES="$OUTDIR/accepted_read_names.txt"
 METRICS="$OUTDIR/recruitment.tsv"
 GRAPH_METRICS="$OUTDIR/recruitment_graph.tsv"
+TAXON_BIN_DIR="$OUTDIR/taxon_bins"
+TAXON_BIN_MANIFEST="$TAXON_BIN_DIR/bin_manifest.tsv"
+TAXON_BIN_SUMMARY="$TAXON_BIN_DIR/bin_summary.tsv"
+TAXON_BIN_ALL_CONTIGS="$TAXON_BIN_DIR/all_bin_contigs.fasta"
+TAXON_BIN_CANDIDATES="$TAXON_BIN_DIR/all_bin_candidate_contigs.fasta"
+TAXON_BIN_PATHS="$TAXON_BIN_DIR/all_bin_graph_paths.fasta"
+TAXON_BIN_PATH_SUMMARY="$TAXON_BIN_DIR/all_bin_graph_path_summary.tsv"
 
 read_fasta() {
     case "$1" in
@@ -1086,6 +1150,264 @@ mapped_primary_names() {
                     print $1
             }
         ' | LC_ALL=C sort -u > "$output"
+}
+
+mapped_primary_assignments() {
+    local bam="$1"
+    local output="$2"
+    samtools view -@ "$THREADS" -F 2308 "$bam" | \
+        awk -v min_fraction="$MIN_READ_ALIGNED_FRACTION" -v min_identity="$MIN_READ_IDENTITY" '
+            function aligned_bases(cigar,    rest, token, total) {
+                rest = cigar
+                total = 0
+                while (match(rest, /[0-9]+[MI=X]/)) {
+                    token = substr(rest, RSTART, RLENGTH)
+                    total += token + 0
+                    rest = substr(rest, RSTART + RLENGTH)
+                }
+                return total
+            }
+            {
+                query_length = length($10)
+                aligned = aligned_bases($6)
+                nm = 0
+                for (i = 12; i <= NF; i++) {
+                    if ($i ~ /^NM:i:/) {
+                        split($i, value, ":")
+                        nm = value[3] + 0
+                        break
+                    }
+                }
+                aligned_fraction = query_length > 0 ? aligned / query_length : 0
+                identity = aligned > 0 ? (aligned - nm) / aligned : 0
+                if (aligned_fraction >= min_fraction && identity >= min_identity)
+                    print $1 "\t" $3
+            }
+        ' | LC_ALL=C sort -u > "$output"
+}
+
+prepare_taxon_bins() {
+    local assignment_file="$OUTDIR/seed/strict_seed_assignments.tsv"
+    local reference_names="$TAXON_BIN_DIR/hit_seed_reference_names.txt"
+    local reference_fasta="$TAXON_BIN_DIR/hit_seed_references.fasta"
+    local left_queries="$TAXON_BIN_DIR/hit_18S_seed_references.fasta"
+    local right_queries="$TAXON_BIN_DIR/hit_28S_seed_references.fasta"
+    local left_hits="$TAXON_BIN_DIR/seed_references_vs_NCBI_SSU.tsv"
+    local right_hits="$TAXON_BIN_DIR/seed_references_vs_NCBI_LSU.tsv"
+    local reference_taxonomy="$TAXON_BIN_DIR/seed_reference_taxonomy.tsv"
+    local template_bins="$TAXON_BIN_DIR/seed_template_bins.tsv"
+
+    printf 'bin_id\tbin_type\tprovisional_taxonomy\tbin_rank\tseed_templates\tselected\tnames_file\n' \
+        > "$TAXON_BIN_MANIFEST"
+    printf 'template\tbin_id\tbin_type\tprovisional_taxonomy\n' > "$template_bins"
+    printf 'reference\trole\taccession\tbitscore\ttaxid\tdomain\tkingdom\tphylum\tclass\torder\tfamily\tgenus\tspecies\tprovisional_bin\texpected_rescue_match\n' \
+        > "$reference_taxonomy"
+    [[ "$TAXON_BINNING" == true ]] || return 0
+    [[ -s "$assignment_file" ]] || return 0
+
+    cut -f2 "$assignment_file" | LC_ALL=C sort -u > "$reference_names"
+    extract_fasta_by_names "$reference_names" "$COMBINED_DB" "$reference_fasta"
+    awk '/^>/ { keep=($0 ~ /^>left\|/) } keep { print }' \
+        "$reference_fasta" > "$left_queries"
+    awk '/^>/ { keep=($0 ~ /^>right\|/) } keep { print }' \
+        "$reference_fasta" > "$right_queries"
+    : > "$left_hits"
+    : > "$right_hits"
+    local fields='6 qseqid saccver bitscore staxids pident length qcovhsp evalue'
+    if [[ -s "$left_queries" ]]; then
+        blastn -query "$left_queries" -db "$NCBI_DB_DIR/SSU_eukaryote_rRNA" \
+            -task blastn -evalue 1e-20 -max_target_seqs 5 -max_hsps 1 \
+            -num_threads "$THREADS" -outfmt "$fields" -out "$left_hits"
+    fi
+    if [[ -s "$right_queries" ]]; then
+        blastn -query "$right_queries" -db "$NCBI_DB_DIR/LSU_eukaryote_rRNA" \
+            -task blastn -evalue 1e-20 -max_target_seqs 5 -max_hsps 1 \
+            -num_threads "$THREADS" -outfmt "$fields" -out "$right_hits"
+    fi
+
+    python3 - "$assignment_file" "$reference_names" "$left_hits" "$right_hits" \
+        "$TAXDUMP_DIR" "$TAXON_BIN_RANK" "$MAX_TAXON_BINS" \
+        "$MIN_TAXON_BIN_TEMPLATES" "$EXPECTED_TAXONOMY" \
+        "$TAXONOMY_NEAR_TOP_FRACTION" "$TAXON_BIN_DIR" \
+        "$reference_taxonomy" "$template_bins" "$TAXON_BIN_MANIFEST" <<'PY'
+import csv
+import re
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+(assignment_path, reference_names_path, left_hits_path, right_hits_path,
+ taxdump_path, bin_rank, max_bins, min_templates, expected,
+ near_top_fraction, output_dir, reference_table, template_table,
+ manifest_path) = sys.argv[1:]
+max_bins = int(max_bins)
+min_templates = int(min_templates)
+near_top_fraction = float(near_top_fraction)
+taxdump = Path(taxdump_path)
+output_dir = Path(output_dir)
+
+parents, node_ranks, names, merged = {}, {}, {}, {}
+with (taxdump / 'nodes.dmp').open() as handle:
+    for line in handle:
+        f = [x.strip() for x in line.split('|')]
+        parents[f[0]], node_ranks[f[0]] = f[1], f[2]
+with (taxdump / 'names.dmp').open() as handle:
+    for line in handle:
+        f = [x.strip() for x in line.split('|')]
+        if len(f) > 3 and f[3] == 'scientific name':
+            names[f[0]] = f[1]
+if (taxdump / 'merged.dmp').exists():
+    with (taxdump / 'merged.dmp').open() as handle:
+        for line in handle:
+            f = [x.strip() for x in line.split('|')]
+            merged[f[0]] = f[1]
+
+ranks = ('domain','kingdom','phylum','class','order','family','genus','species')
+aliases = {'superkingdom':'domain', **{rank:rank for rank in ranks}}
+def lineage(taxid_text):
+    taxid = next((x for x in re.split(r'[,;]', taxid_text) if x.isdigit()), '')
+    while taxid in merged:
+        taxid = merged[taxid]
+    found, seen, current = {}, set(), taxid
+    while current and current not in seen and current in parents:
+        seen.add(current)
+        rank = aliases.get(node_ranks.get(current, ''))
+        if rank and rank not in found:
+            found[rank] = names.get(current, 'NA')
+        parent = parents[current]
+        if parent == current:
+            break
+        current = parent
+    return {rank: found.get(rank, 'NA') for rank in ranks}
+
+def resolved(value):
+    return value not in {'', 'NA', 'N/A', 'unclassified', 'Unclassified'}
+
+hits = defaultdict(list)
+for role, path in (('left', left_hits_path), ('right', right_hits_path)):
+    with open(path) as handle:
+        for line in handle:
+            f = line.rstrip('\n').split('\t')
+            if len(f) != 8:
+                continue
+            hits[f[0]].append({
+                'role': role, 'accession': f[1], 'bitscore': float(f[2]),
+                'taxid': f[3], 'identity': f[4], 'aligned_bp': f[5],
+                'coverage': f[6], 'evalue': f[7], 'lineage': lineage(f[3])})
+
+expected_terms = [x.strip().casefold() for x in re.split(r'[;,|]+', expected) if x.strip()]
+def expected_match(hit):
+    values = [value.casefold() for value in hit['lineage'].values() if resolved(value)]
+    text = '; '.join(values)
+    return bool(expected_terms) and all(
+        term in values or term in text for term in expected_terms)
+
+references = [line.strip() for line in open(reference_names_path) if line.strip()]
+reference_info = {}
+with open(reference_table, 'w', newline='') as handle:
+    fields = ['reference','role','accession','bitscore','taxid',*ranks,
+              'provisional_bin','expected_rescue_match']
+    writer = csv.DictWriter(handle, fieldnames=fields, delimiter='\t', lineterminator='\n')
+    writer.writeheader()
+    for reference in references:
+        observed = sorted(hits.get(reference, []), key=lambda row: row['bitscore'], reverse=True)
+        if observed:
+            top = observed[0]
+            near = [row for row in observed
+                    if row['bitscore'] >= top['bitscore'] * near_top_fraction]
+            taxon = top['lineage'].get(bin_rank, 'NA')
+            phylum = top['lineage'].get('phylum', 'NA')
+            if bin_rank == 'class' and resolved(taxon) and resolved(phylum):
+                provisional = f'{phylum}; {taxon}'
+            elif resolved(taxon):
+                provisional = taxon
+            elif resolved(phylum):
+                provisional = phylum
+            else:
+                provisional = 'Unclassified'
+            rescue = any(expected_match(row) for row in near)
+            info = {**top, 'provisional': provisional, 'rescue': rescue}
+        else:
+            role = 'left' if reference.startswith('left|') else ('right' if reference.startswith('right|') else 'general')
+            info = {'role':role, 'accession':'NA', 'bitscore':0.0, 'taxid':'NA',
+                    'lineage':{rank:'NA' for rank in ranks},
+                    'provisional':'Unclassified', 'rescue':False}
+        reference_info[reference] = info
+        writer.writerow({
+            'reference':reference, 'role':info['role'],
+            'accession':info['accession'], 'bitscore':f"{info['bitscore']:.3f}",
+            'taxid':info['taxid'], **info['lineage'],
+            'provisional_bin':info['provisional'],
+            'expected_rescue_match':str(info['rescue']).lower()})
+
+template_refs = defaultdict(set)
+with open(assignment_path) as handle:
+    for line in handle:
+        f = line.rstrip('\n').split('\t')
+        if len(f) >= 2:
+            template_refs[f[0]].add(f[1])
+
+taxon_templates = defaultdict(set)
+rescue_templates = set()
+for template, refs in template_refs.items():
+    provisional = {reference_info.get(ref, {}).get('provisional', 'Unclassified')
+                   for ref in refs}
+    for taxon in provisional:
+        taxon_templates[taxon].add(template)
+    if any(reference_info.get(ref, {}).get('rescue', False) for ref in refs):
+        rescue_templates.add(template)
+
+ordinary = [(taxon, members) for taxon, members in taxon_templates.items()
+            if len(members) >= min_templates]
+ordinary.sort(key=lambda item: (-len(item[1]), item[0].casefold()))
+selected_taxa = ({taxon for taxon, _ in ordinary} if max_bins == 0 else
+                 {taxon for taxon, _ in ordinary[:max_bins]})
+manifest = []
+template_rows = []
+for number, (taxon, members) in enumerate(ordinary, 1):
+    bin_id = f'bin_{number:03d}'
+    selected = taxon in selected_taxa
+    names_file = output_dir / f'{bin_id}.seed_names.txt'
+    if selected:
+        names_file.write_text(''.join(f'{name}\n' for name in sorted(members)))
+    manifest.append({
+        'bin_id':bin_id, 'bin_type':'provisional_taxon',
+        'provisional_taxonomy':taxon, 'bin_rank':bin_rank,
+        'seed_templates':len(members), 'selected':str(selected).lower(),
+        'names_file':str(names_file) if selected else 'NA'})
+    if selected:
+        template_rows.extend((name, bin_id, 'provisional_taxon', taxon)
+                             for name in sorted(members))
+
+if expected_terms and rescue_templates:
+    bin_id = 'expected_rescue'
+    names_file = output_dir / f'{bin_id}.seed_names.txt'
+    names_file.write_text(''.join(f'{name}\n' for name in sorted(rescue_templates)))
+    manifest.append({
+        'bin_id':bin_id, 'bin_type':'expected_taxon_rescue',
+        'provisional_taxonomy':expected, 'bin_rank':'expected_match',
+        'seed_templates':len(rescue_templates), 'selected':'true',
+        'names_file':str(names_file)})
+    template_rows.extend((name, bin_id, 'expected_taxon_rescue', expected)
+                         for name in sorted(rescue_templates))
+
+with open(template_table, 'w', newline='') as handle:
+    fields = ['template','bin_id','bin_type','provisional_taxonomy']
+    writer = csv.writer(handle, delimiter='\t', lineterminator='\n')
+    writer.writerow(fields)
+    writer.writerows(template_rows)
+with open(manifest_path, 'w', newline='') as handle:
+    fields = ['bin_id','bin_type','provisional_taxonomy','bin_rank',
+              'seed_templates','selected','names_file']
+    writer = csv.DictWriter(handle, fieldnames=fields, delimiter='\t', lineterminator='\n')
+    writer.writeheader()
+    writer.writerows(manifest)
+PY
+
+    local selected_count
+    selected_count=$(awk -F '\t' 'NR > 1 && $6 == "true" { n++ } END { print n + 0 }' \
+        "$TAXON_BIN_MANIFEST")
+    log "Taxonomic seed partitioning selected $selected_count independent bin(s) at $TAXON_BIN_RANK level."
 }
 
 extract_templates_from_bam() {
@@ -1359,6 +1681,31 @@ assemble_final_reads() {
         2> "$OUTDIR/assembly/spades.stderr.log" || \
         die "SPAdes failed; inspect $OUTDIR/assembly/spades.stderr.log"
     [[ -s "$assembly_dir/contigs.fasta" ]] || die "SPAdes produced no contigs."
+}
+
+assemble_reads_in_directory() {
+    local input_r1="$1"
+    local input_r2="$2"
+    local input_single="$3"
+    local assembly_dir="$4"
+    local stdout_log="$5"
+    local stderr_log="$6"
+    local pairs reverse singles
+    pairs=$(fastq_count "$input_r1")
+    reverse=$(fastq_count "$input_r2")
+    singles=$(fastq_count "$input_single")
+    (( pairs == reverse )) || die "Taxon-bin paired FASTQs have different counts."
+    (( pairs + singles > 0 )) || return 1
+    local command=(spades.py --only-assembler -o "$assembly_dir"
+        -t "$THREADS" -m "$SPADES_MEMORY_GB")
+    (( pairs > 0 )) && command+=(-1 "$input_r1" -2 "$input_r2")
+    (( singles > 0 )) && command+=(-s "$input_single")
+    if [[ "$SPADES_MODE" == "meta" && $pairs -gt 0 ]]; then
+        command+=(--meta)
+    fi
+    [[ "$KMERS" != "auto" ]] && command+=(-k "$KMERS")
+    "${command[@]}" > "$stdout_log" 2> "$stderr_log"
+    [[ -s "$assembly_dir/contigs.fasta" ]]
 }
 
 contig_anchor_hits() {
@@ -1728,8 +2075,10 @@ PY
 }
 
 enumerate_graph_paths() {
-    local graph="$OUTDIR/assembly/spades/assembly_graph_with_scaffolds.gfa"
-    local graph_dir="$OUTDIR/validation/graph_paths"
+    local graph="${1:-$OUTDIR/assembly/spades/assembly_graph_with_scaffolds.gfa}"
+    local graph_dir="${2:-$OUTDIR/validation/graph_paths}"
+    local path_prefix="${3:-ITSME_PATH}"
+    local log_label="${4:-Graph-path analysis}"
     local nodes="$graph_dir/graph_segments.fasta"
     local segment_map="$graph_dir/segment_map.tsv"
     local left_hits="$graph_dir/segments_vs_18S.tsv"
@@ -1782,14 +2131,14 @@ PY
     python3 - "$graph" "$segment_map" "$left_hits" "$right_hits" \
         "$paths" "$report" "$ANCHOR_MIN_ALIGNED" "$ANCHOR_MIN_IDENTITY" \
         "$MAX_GRAPH_PATHS" "$MAX_GRAPH_NODES" "$MAX_GRAPH_BP" \
-        "$MIN_GRAPH_DEPTH" "$graph_dir/path_limit_reached.txt" <<'PY'
+        "$MIN_GRAPH_DEPTH" "$graph_dir/path_limit_reached.txt" "$path_prefix" <<'PY'
 import hashlib, re, sys
 from collections import defaultdict
 from pathlib import Path
 
 (graph_path, map_path, left_path, right_path, fasta_path, report_path,
  min_aln, min_identity, max_paths, max_nodes, max_bp, min_depth,
- limit_path) = sys.argv[1:]
+ limit_path, path_prefix) = sys.argv[1:]
 min_aln, min_identity = int(min_aln), float(min_identity)
 max_paths, max_nodes, max_bp = int(max_paths), int(max_nodes), int(max_bp)
 min_depth = float(min_depth)
@@ -1931,7 +2280,7 @@ with open(fasta_path, 'w') as fasta, open(report_path, 'w') as report:
     report.write('path_id\tlength_bp\tnode_count\tminimum_graph_depth\tmean_graph_depth\t'
                  'left_segment\tright_segment\tnode_path\tjunction_positions\tpath_status\n')
     for number, (path, sequence, junctions) in enumerate(unique, 1):
-        path_id = f'ITSME_PATH_{number:06d}'
+        path_id = f'{path_prefix}_{number:06d}'
         observed_depths = [depths.get(state[0], 0.0) for state in path
                            if depths.get(state[0], 0.0) > 0]
         minimum = min(observed_depths) if observed_depths else 0.0
@@ -1953,11 +2302,325 @@ PY
 
     local count
     count=$(awk '/^>/ { n++ } END { print n + 0 }' "$paths")
-    log "Graph-path analysis recovered $count distinct bounded 18S-to-28S candidate path(s)."
+    log "$log_label recovered $count distinct bounded 18S-to-28S candidate path(s)."
     if [[ -s "$graph_dir/path_limit_reached.txt" ]] && \
        grep -qx 'true' "$graph_dir/path_limit_reached.txt"; then
         log "WARNING: graph-path enumeration reached --max-graph-paths=$MAX_GRAPH_PATHS; all emitted paths are retained, but additional graph alternatives may exist."
     fi
+}
+
+run_one_taxon_bin() {
+    local bin_id="$1"
+    local bin_type="$2"
+    local provisional_taxonomy="$3"
+    local seed_names="$4"
+    local bin_dir="$TAXON_BIN_DIR/$bin_id"
+    local accepted_names="$bin_dir/accepted_names.txt"
+    local metrics="$bin_dir/recruitment.tsv"
+    mkdir -p "$bin_dir"
+    cp -- "$seed_names" "$accepted_names"
+
+    local seed_count accepted_count accepted_initial
+    seed_count=$(awk 'END { print NR + 0 }' "$accepted_names")
+    accepted_count="$seed_count"
+    accepted_initial="$seed_count"
+    printf 'round\tfrontier_templates\tcandidate_templates\tnew_templates\taccepted_total\tgrowth_fraction\tdecision\n' \
+        > "$metrics"
+    printf '0\t%d\t%d\t%d\t%d\tNA\tseed\n' "$seed_count" "$seed_count" \
+        "$seed_count" "$seed_count" >> "$metrics"
+
+    local seed_raw_r1="$bin_dir/seed_raw_R1.fastq.gz"
+    local seed_raw_r2="$bin_dir/seed_raw_R2.fastq.gz"
+    local seed_raw_single="$bin_dir/seed_raw_single.fastq.gz"
+    local seed_r1="$bin_dir/seed_R1.fastq.gz"
+    local seed_r2="$bin_dir/seed_R2.fastq.gz"
+    local seed_single="$bin_dir/seed_single.fastq.gz"
+    extract_templates_from_bam "$accepted_names" "$seed_raw_r1" "$seed_raw_r2" \
+        "$seed_raw_single" "$bin_dir/seed_extract"
+    prepare_recruited_batch "$seed_raw_r1" "$seed_raw_r2" "$seed_raw_single" \
+        "$bin_dir/seed_qc" "$seed_r1" "$seed_r2" "$seed_single"
+    local bin_r1_files=("$seed_r1")
+    local bin_r2_files=("$seed_r2")
+    local bin_single_files=("$seed_single")
+    local accepted_rounds=0
+    local stopping_reason="seed only"
+
+    if (( TAXON_BIN_MAX_ROUNDS > 0 && accepted_count < MAX_TAXON_BIN_TEMPLATES )); then
+        local frontier_names="$bin_dir/inward_frontier_names.txt"
+        if [[ "$INWARD" == true && -s "$OUTDIR/seed/inward_terminal_candidate_names.txt" ]]; then
+            LC_ALL=C comm -12 "$accepted_names" \
+                "$OUTDIR/seed/inward_terminal_candidate_names.txt" > "$frontier_names"
+        else
+            cp -- "$accepted_names" "$frontier_names"
+        fi
+        local frontier_count
+        frontier_count=$(awk 'END { print NR + 0 }' "$frontier_names")
+        if (( frontier_count > 0 )); then
+            local frontier_raw_r1="$bin_dir/frontier_raw_R1.fastq.gz"
+            local frontier_raw_r2="$bin_dir/frontier_raw_R2.fastq.gz"
+            local frontier_raw_single="$bin_dir/frontier_raw_single.fastq.gz"
+            local frontier_r1="$bin_dir/frontier_R1.fastq.gz"
+            local frontier_r2="$bin_dir/frontier_R2.fastq.gz"
+            local frontier_single="$bin_dir/frontier_single.fastq.gz"
+            local frontier_baits="$bin_dir/round_00_frontier_baits.fasta"
+            extract_templates_from_bam "$frontier_names" "$frontier_raw_r1" \
+                "$frontier_raw_r2" "$frontier_raw_single" "$bin_dir/frontier_extract"
+            prepare_recruited_batch "$frontier_raw_r1" "$frontier_raw_r2" \
+                "$frontier_raw_single" "$bin_dir/frontier_qc" \
+                "$frontier_r1" "$frontier_r2" "$frontier_single"
+            make_frontier_baits "$frontier_baits" "$bin_dir/round_00_bait_filter.log" \
+                "$frontier_r1" "$frontier_r2" "$frontier_single"
+            stopping_reason="maximum per-bin inward rounds reached"
+
+            local round
+            for (( round = 1; round <= TAXON_BIN_MAX_ROUNDS; round++ )); do
+                local round_dir
+                printf -v round_dir '%s/round_%02d' "$bin_dir" "$round"
+                mkdir -p "$round_dir"
+                local candidate_names="$round_dir/candidate_names.txt"
+                local new_names="$round_dir/new_names.txt"
+                frontier_count=$(awk 'END { print NR + 0 }' "$frontier_names")
+                scan_raw_with_baits "$frontier_baits" "$candidate_names" \
+                    "$round_dir/bbduk"
+                LC_ALL=C comm -23 "$candidate_names" "$accepted_names" > "$new_names"
+                local candidate_count new_count growth proposed_count
+                candidate_count=$(awk 'END { print NR + 0 }' "$candidate_names")
+                new_count=$(awk 'END { print NR + 0 }' "$new_names")
+                growth=$(fraction "$new_count" "$accepted_count")
+                proposed_count=$((accepted_count + new_count))
+                if (( new_count == 0 )); then
+                    printf '%d\t%d\t%d\t0\t%d\t0.00000000\tconverged\n' \
+                        "$round" "$frontier_count" "$candidate_count" \
+                        "$accepted_count" >> "$metrics"
+                    stopping_reason="inward recruitment converged"
+                    break
+                elif greater_than "$growth" "$MAX_ROUND_GROWTH"; then
+                    printf '%d\t%d\t%d\t%d\t%d\t%s\trejected_growth\n' \
+                        "$round" "$frontier_count" "$candidate_count" "$new_count" \
+                        "$accepted_count" "$growth" >> "$metrics"
+                    stopping_reason="inward growth guard"
+                    break
+                elif (( proposed_count > MAX_TAXON_BIN_TEMPLATES )); then
+                    printf '%d\t%d\t%d\t%d\t%d\t%s\trejected_bin_ceiling\n' \
+                        "$round" "$frontier_count" "$candidate_count" "$new_count" \
+                        "$accepted_count" "$growth" >> "$metrics"
+                    stopping_reason="per-bin template ceiling"
+                    break
+                fi
+
+                LC_ALL=C sort -u "$accepted_names" "$new_names" \
+                    > "$round_dir/accepted_names.next.txt"
+                mv -- "$round_dir/accepted_names.next.txt" "$accepted_names"
+                accepted_count="$proposed_count"
+                accepted_rounds=$((accepted_rounds + 1))
+                local raw_r1="$round_dir/new_raw_R1.fastq.gz"
+                local raw_r2="$round_dir/new_raw_R2.fastq.gz"
+                local raw_single="$round_dir/new_raw_single.fastq.gz"
+                local clean_r1="$round_dir/new_R1.fastq.gz"
+                local clean_r2="$round_dir/new_R2.fastq.gz"
+                local clean_single="$round_dir/new_single.fastq.gz"
+                extract_templates_from_bam "$new_names" "$raw_r1" "$raw_r2" \
+                    "$raw_single" "$round_dir/extract"
+                prepare_recruited_batch "$raw_r1" "$raw_r2" "$raw_single" \
+                    "$round_dir/qc" "$clean_r1" "$clean_r2" "$clean_single"
+                bin_r1_files+=("$clean_r1")
+                bin_r2_files+=("$clean_r2")
+                bin_single_files+=("$clean_single")
+                printf '%d\t%d\t%d\t%d\t%d\t%s\taccepted_inward\n' \
+                    "$round" "$frontier_count" "$candidate_count" "$new_count" \
+                    "$accepted_count" "$growth" >> "$metrics"
+                frontier_names="$new_names"
+                frontier_baits="$round_dir/frontier_baits.fasta"
+                make_frontier_baits "$frontier_baits" "$round_dir/bait_filter.log" \
+                    "$clean_r1" "$clean_r2" "$clean_single"
+                [[ "$KEEP_INTERMEDIATES" == true ]] || \
+                    rm -f -- "$raw_r1" "$raw_r2" "$raw_single"
+                if (( new_count < MIN_NEW_TEMPLATES )); then
+                    stopping_reason="minimum new-template threshold"
+                    break
+                elif less_than "$growth" "$MIN_GROWTH"; then
+                    stopping_reason="minimum growth threshold"
+                    break
+                fi
+            done
+            if [[ "$KEEP_INTERMEDIATES" != true ]]; then
+                rm -f -- "$frontier_raw_r1" "$frontier_raw_r2" \
+                    "$frontier_raw_single" "$frontier_r1" "$frontier_r2" \
+                    "$frontier_single"
+            fi
+        else
+            stopping_reason="no inward terminal frontier"
+        fi
+    elif (( accepted_count >= MAX_TAXON_BIN_TEMPLATES )); then
+        stopping_reason="seed bin already reached per-bin template ceiling"
+    fi
+
+    local outward_accepted=0
+    if (( TAXON_BIN_MAX_ROUNDS > 0 )) && \
+       [[ "$OUTWARD" == true && -s "$OUTDIR/seed/outward_terminal_candidate_names.txt" && \
+          $accepted_count -lt $MAX_TAXON_BIN_TEMPLATES ]]; then
+        local outward_dir="$bin_dir/outward_once"
+        mkdir -p "$outward_dir"
+        local outward_frontier="$outward_dir/frontier_names.txt"
+        LC_ALL=C comm -12 "$accepted_names" \
+            "$OUTDIR/seed/outward_terminal_candidate_names.txt" > "$outward_frontier"
+        local outward_frontier_count
+        outward_frontier_count=$(awk 'END { print NR + 0 }' "$outward_frontier")
+        if (( outward_frontier_count > 0 )); then
+            local of_raw_r1="$outward_dir/frontier_raw_R1.fastq.gz"
+            local of_raw_r2="$outward_dir/frontier_raw_R2.fastq.gz"
+            local of_raw_single="$outward_dir/frontier_raw_single.fastq.gz"
+            local of_r1="$outward_dir/frontier_R1.fastq.gz"
+            local of_r2="$outward_dir/frontier_R2.fastq.gz"
+            local of_single="$outward_dir/frontier_single.fastq.gz"
+            local of_baits="$outward_dir/frontier_baits.fasta"
+            local of_candidates="$outward_dir/candidate_names.txt"
+            local of_new="$outward_dir/new_names.txt"
+            extract_templates_from_bam "$outward_frontier" "$of_raw_r1" "$of_raw_r2" \
+                "$of_raw_single" "$outward_dir/frontier_extract"
+            prepare_recruited_batch "$of_raw_r1" "$of_raw_r2" "$of_raw_single" \
+                "$outward_dir/frontier_qc" "$of_r1" "$of_r2" "$of_single"
+            make_frontier_baits "$of_baits" "$outward_dir/bait_filter.log" \
+                "$of_r1" "$of_r2" "$of_single"
+            scan_raw_with_baits "$of_baits" "$of_candidates" "$outward_dir/bbduk" \
+                "$WORD_SIZE" "$OUTWARD_MIN_WORD_HITS"
+            LC_ALL=C comm -23 "$of_candidates" "$accepted_names" > "$of_new"
+            local of_count of_growth of_proposed
+            of_count=$(awk 'END { print NR + 0 }' "$of_new")
+            of_growth=$(fraction "$of_count" "$accepted_count")
+            of_proposed=$((accepted_count + of_count))
+            if (( of_count > 0 && \
+                  (MAX_OUTWARD_TEMPLATES == 0 || of_count <= MAX_OUTWARD_TEMPLATES) && \
+                  of_proposed <= MAX_TAXON_BIN_TEMPLATES )) && \
+                    ! greater_than "$of_growth" "$MAX_OUTWARD_GROWTH"; then
+                LC_ALL=C sort -u "$accepted_names" "$of_new" \
+                    > "$outward_dir/accepted_names.next.txt"
+                mv -- "$outward_dir/accepted_names.next.txt" "$accepted_names"
+                accepted_count="$of_proposed"
+                outward_accepted="$of_count"
+                local on_raw_r1="$outward_dir/new_raw_R1.fastq.gz"
+                local on_raw_r2="$outward_dir/new_raw_R2.fastq.gz"
+                local on_raw_single="$outward_dir/new_raw_single.fastq.gz"
+                local on_r1="$outward_dir/new_R1.fastq.gz"
+                local on_r2="$outward_dir/new_R2.fastq.gz"
+                local on_single="$outward_dir/new_single.fastq.gz"
+                extract_templates_from_bam "$of_new" "$on_raw_r1" "$on_raw_r2" \
+                    "$on_raw_single" "$outward_dir/extract"
+                prepare_recruited_batch "$on_raw_r1" "$on_raw_r2" "$on_raw_single" \
+                    "$outward_dir/qc" "$on_r1" "$on_r2" "$on_single"
+                bin_r1_files+=("$on_r1")
+                bin_r2_files+=("$on_r2")
+                bin_single_files+=("$on_single")
+                [[ "$KEEP_INTERMEDIATES" == true ]] || \
+                    rm -f -- "$on_raw_r1" "$on_raw_r2" "$on_raw_single"
+            fi
+            if [[ "$KEEP_INTERMEDIATES" != true ]]; then
+                rm -f -- "$of_raw_r1" "$of_raw_r2" "$of_raw_single" \
+                    "$of_r1" "$of_r2" "$of_single"
+            fi
+        fi
+    fi
+
+    local final_r1="$bin_dir/accepted_R1.fastq.gz"
+    local final_r2="$bin_dir/accepted_R2.fastq.gz"
+    local final_single="$bin_dir/accepted_single.fastq.gz"
+    combine_fastqs "$final_r1" "${bin_r1_files[@]}"
+    combine_fastqs "$final_r2" "${bin_r2_files[@]}"
+    combine_fastqs "$final_single" "${bin_single_files[@]}"
+    TAXON_BIN_R1_FILES+=("$final_r1")
+    TAXON_BIN_R2_FILES+=("$final_r2")
+    TAXON_BIN_SINGLE_FILES+=("$final_single")
+    log "Taxon bin $bin_id ($provisional_taxonomy): assembling $accepted_count accepted templates."
+    local spades_dir="$bin_dir/spades"
+    if ! assemble_reads_in_directory "$final_r1" "$final_r2" "$final_single" \
+            "$spades_dir" "$bin_dir/spades.stdout.log" "$bin_dir/spades.stderr.log"; then
+        log "WARNING: taxon bin $bin_id assembly failed; pooled fallback results remain available."
+        printf '%s\t%s\t%s\t%d\t%d\t%d\t0\t0\tassembly_failed\n' \
+            "$bin_id" "$bin_type" "$provisional_taxonomy" "$accepted_initial" \
+            "$accepted_count" "$accepted_rounds" >> "$TAXON_BIN_SUMMARY"
+        return 0
+    fi
+
+    local prefix
+    prefix=$(printf '%s' "$bin_id" | tr '[:lower:]-' '[:upper:]_')
+    local renamed_contigs="$bin_dir/contigs.prefixed.fasta"
+    awk -v prefix="ITSME_${prefix}_" '
+        /^>/ { sub(/^>/, ">" prefix); print; next }
+        { print }
+    ' "$spades_dir/contigs.fasta" > "$renamed_contigs"
+    awk '{ print }' "$renamed_contigs" >> "$TAXON_BIN_ALL_CONTIGS"
+    local anchor_hits="$bin_dir/seed_anchor_hits.tsv"
+    local candidate_names="$bin_dir/candidate_contig_names.txt"
+    local candidate_contigs="$bin_dir/candidate_contigs.fasta"
+    contig_anchor_hits "$renamed_contigs" "$SEED_INDEX" "$anchor_hits" \
+        "$bin_dir/seed_anchor.log"
+    awk '{ print $1 }' "$anchor_hits" | LC_ALL=C sort -u > "$candidate_names"
+    extract_fasta_by_names "$candidate_names" "$renamed_contigs" "$candidate_contigs"
+    filter_fasta_min_length "$candidate_contigs" "$bin_dir/candidate_contigs.filtered.fasta" \
+        "$MIN_REPORT_LENGTH"
+    mv -- "$bin_dir/candidate_contigs.filtered.fasta" "$candidate_contigs"
+    awk '{ print }' "$candidate_contigs" >> "$TAXON_BIN_CANDIDATES"
+
+    local graph_dir="$bin_dir/graph_paths"
+    enumerate_graph_paths "$spades_dir/assembly_graph_with_scaffolds.gfa" \
+        "$graph_dir" "ITSME_${prefix}_PATH" "Taxon bin $bin_id graph analysis"
+    [[ -s "$graph_dir/graph_candidate_paths.fasta" ]] && \
+        awk '{ print }' "$graph_dir/graph_candidate_paths.fasta" >> "$TAXON_BIN_PATHS"
+    [[ -s "$graph_dir/graph_path_summary.tsv" ]] && \
+        tail -n +2 "$graph_dir/graph_path_summary.tsv" >> "$TAXON_BIN_PATH_SUMMARY"
+
+    local contig_count path_count
+    contig_count=$(awk '/^>/ { n++ } END { print n + 0 }' "$candidate_contigs")
+    path_count=$(awk '/^>/ { n++ } END { print n + 0 }' \
+        "$graph_dir/graph_candidate_paths.fasta")
+    printf '%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%s\n' \
+        "$bin_id" "$bin_type" "$provisional_taxonomy" "$accepted_initial" \
+        "$accepted_count" "$accepted_rounds" "$contig_count" "$path_count" \
+        "$stopping_reason; outward_new=$outward_accepted" >> "$TAXON_BIN_SUMMARY"
+    if [[ "$KEEP_INTERMEDIATES" != true ]]; then
+        rm -f -- "$seed_raw_r1" "$seed_raw_r2" "$seed_raw_single"
+    fi
+}
+
+run_taxon_binned_assemblies() {
+    : > "$TAXON_BIN_ALL_CONTIGS"
+    : > "$TAXON_BIN_CANDIDATES"
+    : > "$TAXON_BIN_PATHS"
+    printf 'path_id\tlength_bp\tnode_count\tminimum_graph_depth\tmean_graph_depth\tleft_segment\tright_segment\tnode_path\tjunction_positions\tpath_status\n' \
+        > "$TAXON_BIN_PATH_SUMMARY"
+    printf 'bin_id\tbin_type\tprovisional_taxonomy\tseed_templates\taccepted_templates\taccepted_inward_rounds\tseed_anchored_contigs\tgraph_paths\tstopping_reason\n' \
+        > "$TAXON_BIN_SUMMARY"
+    [[ "$TAXON_BINNING" == true && -s "$TAXON_BIN_MANIFEST" ]] || return 0
+
+    if (( TAXON_BIN_MAX_ROUNDS > 0 )) && [[ "$INWARD" == true && \
+          ! -s "$OUTDIR/seed/inward_terminal_candidate_names.txt" ]]; then
+        make_directional_seed_baits "$OUTDIR/seed/inward_terminal_seeds.fasta" "inward"
+        scan_raw_with_baits "$OUTDIR/seed/inward_terminal_seeds.fasta" \
+            "$OUTDIR/seed/inward_terminal_candidate_names.txt" \
+            "$OUTDIR/seed/inward_terminal_scan"
+    fi
+    if (( TAXON_BIN_MAX_ROUNDS > 0 )) && [[ "$OUTWARD" == true && \
+          ! -s "$OUTDIR/seed/outward_terminal_candidate_names.txt" ]]; then
+        make_directional_seed_baits "$OUTDIR/seed/outward_terminal_seeds.fasta" "outward"
+        scan_raw_with_baits "$OUTDIR/seed/outward_terminal_seeds.fasta" \
+            "$OUTDIR/seed/outward_terminal_candidate_names.txt" \
+            "$OUTDIR/seed/outward_terminal_scan"
+    fi
+
+    local bin_id bin_type provisional rank seed_count selected names_file
+    while IFS=$'\t' read -r bin_id bin_type provisional rank seed_count selected names_file; do
+        [[ "$bin_id" == "bin_id" || "$selected" != "true" ]] && continue
+        [[ -s "$names_file" ]] || continue
+        run_one_taxon_bin "$bin_id" "$bin_type" "$provisional" "$names_file"
+    done < "$TAXON_BIN_MANIFEST"
+}
+
+merge_taxon_bin_graph_paths() {
+    local global_dir="$OUTDIR/validation/graph_paths"
+    [[ -s "$TAXON_BIN_PATHS" ]] && \
+        awk '{ print }' "$TAXON_BIN_PATHS" >> "$global_dir/graph_candidate_paths.fasta"
+    [[ -s "$TAXON_BIN_PATH_SUMMARY" ]] && \
+        tail -n +2 "$TAXON_BIN_PATH_SUMMARY" >> "$global_dir/graph_path_summary.tsv"
 }
 
 prepare_locus_candidate_set() {
@@ -2002,7 +2665,13 @@ with output.open('w') as fasta, provenance.open('w') as table, \
     table.write('contig\tsource\tsource_header\tlength_bp\n')
     duplicate_table.write('path_id\tduplicate_native_contig\tlength_bp\treason\n')
     for name, description, sequence in records(contigs):
-        native_sequences.setdefault(canonical(sequence), name)
+        digest = canonical(sequence)
+        duplicate = native_sequences.get(digest)
+        if duplicate:
+            duplicate_table.write(
+                f'{name}\t{duplicate}\t{len(sequence)}\texact_native_sequence_duplicate\n')
+            continue
+        native_sequences[digest] = name
         fasta.write(f'>{description}\n')
         for start in range(0, len(sequence), 80):
             fasta.write(sequence[start:start + 80] + '\n')
@@ -2184,9 +2853,12 @@ run_competitive_readback() {
     # This is deliberately noncompetitive: a read that supports a shared graph
     # edge supports every compatible path, rather than being assigned at random
     # to one nearly identical Bowtie2 target.
+    local junction_fastqs=("$FINAL_R1" "$FINAL_R2" "$FINAL_SINGLE")
+    junction_fastqs+=("${TAXON_BIN_R1_FILES[@]}" "${TAXON_BIN_R2_FILES[@]}" \
+        "${TAXON_BIN_SINGLE_FILES[@]}")
     python3 - "$OUTDIR/validation/graph_paths/graph_path_summary.tsv" \
         "$OUTDIR/final/contig_validation.tsv" "$targets" "$junction_support" \
-        "$JUNCTION_FLANK" "$FINAL_R1" "$FINAL_R2" "$FINAL_SINGLE" <<'PY'
+        "$JUNCTION_FLANK" "${junction_fastqs[@]}" <<'PY'
 import csv
 import gzip
 import re
@@ -3131,6 +3803,7 @@ fi
 log "Seed mapping: aligning the original raw reads once."
 map_raw_reads_to_seeds
 mapped_primary_names "$SEED_BAM" "$OUTDIR/seed/strict_seed_hit_names.txt"
+mapped_primary_assignments "$SEED_BAM" "$OUTDIR/seed/strict_seed_assignments.tsv"
 cp -- "$OUTDIR/seed/strict_seed_hit_names.txt" "$ACCEPTED_NAMES"
 
 ACCEPTED_COUNT=$(awk 'END { print NR + 0 }' "$ACCEPTED_NAMES")
@@ -3142,6 +3815,15 @@ if greater_than "$ACCEPTED_FRACTION" "$MAX_ACCEPTED_FRACTION"; then
 fi
 if (( MAX_ACCEPTED_TEMPLATES > 0 && ACCEPTED_COUNT > MAX_ACCEPTED_TEMPLATES )); then
     log "WARNING: seed hits already exceed --max-accepted-templates; extension will remain guarded but seed hits are retained."
+fi
+
+if [[ "$TAXON_BINNING" == true && ${#LEFT_DATABASES[@]} -gt 0 && \
+      ${#RIGHT_DATABASES[@]} -gt 0 ]]; then
+    log "Classifying strict seed-hit references and partitioning seed templates."
+    prepare_taxon_bins
+else
+    printf 'bin_id\tbin_type\tprovisional_taxonomy\tbin_rank\tseed_templates\tselected\tnames_file\n' \
+        > "$TAXON_BIN_MANIFEST"
 fi
 
 printf 'round\tfrontier_templates\tcandidate_templates\tnew_templates\taccepted_total\tgrowth_fraction\taccepted_fraction\tdecision\n' \
@@ -3347,6 +4029,8 @@ if (( MAX_ROUNDS > 0 )); then
         log "Conservative outward extension: locating seed-hit templates at the 18S 5' and 28S 3' ends."
         scan_raw_with_baits "$OUTWARD_SEEDS" "$OUTWARD_TERMINAL_CANDIDATES" \
             "$OUTWARD_DIR/terminal_scan"
+        cp -- "$OUTWARD_TERMINAL_CANDIDATES" \
+            "$OUTDIR/seed/outward_terminal_candidate_names.txt"
         LC_ALL=C comm -12 "$ACCEPTED_NAMES" "$OUTWARD_TERMINAL_CANDIDATES" \
             > "$OUTWARD_FRONTIER_NAMES"
         OUTWARD_FRONTIER_COUNT=$(awk 'END { print NR + 0 }' "$OUTWARD_FRONTIER_NAMES")
@@ -3461,10 +4145,18 @@ combine_fastqs "$FINAL_SINGLE" "${ASSEMBLY_SINGLE_FILES[@]}"
 log "Final assembly: running SPAdes once with all accepted, QC-filtered reads."
 assemble_final_reads "$FINAL_R1" "$FINAL_R2" "$FINAL_SINGLE"
 
+if [[ "$TAXON_BINNING" == true ]]; then
+    log "Taxon-binned rescue: extending and assembling each selected seed bin independently."
+fi
+run_taxon_binned_assemblies
+
 ALL_CONTIGS="$OUTDIR/final/all_assembled_contigs.fasta"
 CANDIDATE_CONTIGS="$OUTDIR/final/rrna_candidate_contigs.fasta"
 DUAL_CONTIGS="$OUTDIR/final/rrna_dual_anchor_contigs.fasta"
 cp -- "$OUTDIR/assembly/spades/contigs.fasta" "$ALL_CONTIGS"
+if [[ -s "$TAXON_BIN_ALL_CONTIGS" ]]; then
+    awk '{ print }' "$TAXON_BIN_ALL_CONTIGS" >> "$ALL_CONTIGS"
+fi
 
 contig_anchor_hits "$ALL_CONTIGS" "$SEED_INDEX" \
     "$OUTDIR/final/all_seed_anchor_hits.tsv" "$OUTDIR/final/all_seed_anchor.log"
@@ -3490,6 +4182,7 @@ if (( ${#LEFT_DATABASES[@]} > 0 && ${#RIGHT_DATABASES[@]} > 0 )); then
         log "Graph-aware reconstruction: enumerating bounded 18S-to-28S paths."
     fi
     enumerate_graph_paths
+    merge_taxon_bin_graph_paths
     prepare_locus_candidate_set
     ALL_LOCUS_CANDIDATES="$OUTDIR/validation/analysis_locus_candidates.fasta"
 
@@ -3604,6 +4297,11 @@ else
     GRAPH_PATH_BP=0
 fi
 read -r PARTIAL_LOCUS_COUNT PARTIAL_LOCUS_BP < <(fasta_stats "$OUTDIR/final/partial_locus_contigs.fasta")
+SELECTED_TAXON_BIN_COUNT=$(awk -F '\t' 'NR > 1 && $6 == "true" { n++ } END { print n + 0 }' \
+    "$TAXON_BIN_MANIFEST")
+ASSEMBLED_TAXON_BIN_COUNT=$(awk -F '\t' 'NR > 1 && $9 !~ /assembly_failed/ { n++ } END { print n + 0 }' \
+    "$TAXON_BIN_SUMMARY")
+read -r TAXON_BIN_PATH_COUNT TAXON_BIN_PATH_BP < <(fasta_stats "$TAXON_BIN_PATHS")
 VARIANT_COUNT=$(awk 'END { print (NR > 0 ? NR - 1 : 0) }' "$OUTDIR/final/residual_variants.tsv")
 PARTIAL_REPORT_COUNT=$(awk 'END { print (NR > 0 ? NR - 1 : 0) }' "$OUTDIR/partials.csv")
 # Report taxonomy counts for the concise biological output, not for rejected
@@ -3643,6 +4341,15 @@ printf '%s\n' \
     "Stopping reason: $STOP_REASON" \
     "Maximum accepted templates: $MAX_ACCEPTED_TEMPLATES" \
     "Maximum accepted fraction: $MAX_ACCEPTED_FRACTION" \
+    "Taxonomic binning enabled: $TAXON_BINNING" \
+    "Taxonomic bin rank: $TAXON_BIN_RANK" \
+    "Selected taxonomic bins: $SELECTED_TAXON_BIN_COUNT" \
+    "Successfully assembled taxonomic bins: $ASSEMBLED_TAXON_BIN_COUNT" \
+    "Taxon-bin graph paths: $TAXON_BIN_PATH_COUNT" \
+    "Taxon-bin graph-path bp: $TAXON_BIN_PATH_BP" \
+    "Expected-taxon rescue query: ${EXPECTED_TAXONOMY:-NA}" \
+    "Per-bin maximum accepted templates: $MAX_TAXON_BIN_TEMPLATES" \
+    "Per-bin inward rounds: $TAXON_BIN_MAX_ROUNDS" \
     "rRNA database directory: ${DB_DIR:-explicit database files}" \
     "Extension direction: $EXTENSION_DIRECTION" \
     "Inward mode: $INWARD" \
@@ -3697,6 +4404,8 @@ if [[ "$KEEP_BAM" != true ]]; then
 fi
 
 log "Finished. Candidate contigs: $CANDIDATE_CONTIGS"
+log "Taxon-bin manifest: $TAXON_BIN_MANIFEST"
+log "Taxon-bin results: $TAXON_BIN_SUMMARY"
 if [[ "$GRAPH_PATHS" == true ]]; then
     log "All bounded graph paths: $OUTDIR/validation/graph_paths/graph_candidate_paths.fasta"
     log "Promoted reconstructed loci: $OUTDIR/final/reconstructed_graph_loci.fasta"
