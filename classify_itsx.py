@@ -127,6 +127,52 @@ def read_fasta(path: Path | None) -> dict[str, str]:
     return {name: "".join(sequence) for name, sequence in records.items()}
 
 
+def canonical_contig_id(sequence_id: str, catalog_ids: set[str]) -> str | None:
+    """Resolve an ITSx region-record ID to its parent assembly contig.
+
+    ITSx versions can append a region label to FASTA identifiers (for example,
+    ``|SSU`` or ``_LSU``), while positions.txt retains the original identifier.
+    Exact matching therefore silently loses otherwise valid BLAST assignments.
+    Only exact or delimiter-bounded prefix matches are accepted here so that
+    NODE_1 cannot be confused with NODE_10.
+    """
+    if sequence_id in catalog_ids:
+        return sequence_id
+    candidates = []
+    for contig in catalog_ids:
+        if not sequence_id.startswith(contig):
+            continue
+        remainder = sequence_id[len(contig):]
+        if remainder and remainder[0] in "|:;./_-":
+            candidates.append(contig)
+    if not candidates:
+        return None
+    longest = max(len(contig) for contig in candidates)
+    best = [contig for contig in candidates if len(contig) == longest]
+    return best[0] if len(best) == 1 else None
+
+
+def canonicalize_records(records: dict[str, str], catalog_ids: set[str],
+                         label: str) -> dict[str, str]:
+    """Rename ITSx region records to parent contig IDs, retaining longest duplicates."""
+    normalized: dict[str, str] = {}
+    unmatched = 0
+    for sequence_id, sequence in records.items():
+        contig = canonical_contig_id(sequence_id, catalog_ids)
+        if contig is None:
+            unmatched += 1
+            continue
+        if len(sequence) > len(normalized.get(contig, "")):
+            normalized[contig] = sequence
+    if unmatched:
+        print(
+            f"WARNING: {unmatched} {label} record ID(s) could not be matched "
+            "unambiguously to ITSx positions.txt",
+            file=sys.stderr,
+        )
+    return normalized
+
+
 def write_fasta(records: dict[str, str], path: Path) -> None:
     with path.open("w") as handle:
         for name in sorted(records):
@@ -340,8 +386,10 @@ def lineage_for(taxids: str, taxonomy) -> tuple[dict[str, str], str]:
     return result, names.get(taxid, "NA")
 
 
-def parse_raw_hits(path: Path, marker: str, taxonomy) -> list[dict[str, str]]:
+def parse_raw_hits(path: Path, marker: str, taxonomy,
+                   catalog_ids: set[str]) -> list[dict[str, str]]:
     rows = []
+    unmatched = 0
     if not path.exists() or not path.stat().st_size:
         return rows
     with path.open() as handle:
@@ -350,11 +398,22 @@ def parse_raw_hits(path: Path, marker: str, taxonomy) -> list[dict[str, str]]:
             if len(fields) != 10:
                 continue
             row = dict(zip(RAW_FIELDS, fields))
+            contig = canonical_contig_id(row["query"], catalog_ids)
+            if contig is None:
+                unmatched += 1
+                continue
+            row["query"] = contig
             ranks, scientific_name = lineage_for(row["taxids"], taxonomy)
             row.update(ranks)
             row["scientific_names"] = scientific_name
             row["marker"] = marker
             rows.append(row)
+    if unmatched:
+        print(
+            f"WARNING: ignored {unmatched} {marker} BLAST hit(s) whose query IDs "
+            "could not be matched unambiguously to ITSx positions.txt",
+            file=sys.stderr,
+        )
     return rows
 
 
@@ -431,23 +490,38 @@ def main() -> None:
 
     positions = prefix_file(prefix, "positions.txt")
     catalog = parse_positions(positions)
-    complete_ids = fasta_ids(prefix_file(prefix, "full.fasta"))
+    catalog_ids = set(catalog)
+    complete_ids = {
+        contig for sequence_id in fasta_ids(prefix_file(prefix, "full.fasta"))
+        if (contig := canonical_contig_id(sequence_id, catalog_ids)) is not None
+    }
 
-    queries = {
-        "SSU": choose_region_file(prefix, "SSU"),
-        "LSU": choose_region_file(prefix, "LSU"),
+    marker_records = {
+        marker: canonicalize_records(
+            read_fasta(choose_region_file(prefix, marker)), catalog_ids, marker
+        )
+        for marker in ("SSU", "LSU")
     }
     its_parts = {
-        region: read_fasta(choose_region_file(prefix, region))
+        region: canonicalize_records(
+            read_fasta(choose_region_file(prefix, region)), catalog_ids, region
+        )
         for region in ("ITS1", "5_8S", "ITS2")
     }
     its_records = {
         contig: "".join(its_parts[region].get(contig, "") for region in ("ITS1", "5_8S", "ITS2"))
         for contig in catalog
     }
-    its_query = outdir / "ITS_queries.fasta"
-    write_fasta({name: seq for name, seq in its_records.items() if seq}, its_query)
-    queries["ITS"] = its_query
+    queries = {}
+    for marker, records in (
+        ("SSU", marker_records["SSU"]),
+        ("ITS", {name: seq for name, seq in its_records.items() if seq}),
+        ("LSU", marker_records["LSU"]),
+    ):
+        query_path = outdir / f"{marker}_queries.fasta"
+        write_fasta(records, query_path)
+        queries[marker] = query_path
+        print(f"Prepared {len(records)} normalized {marker} query sequence(s).", file=sys.stderr)
 
     raw_paths = {marker: outdir / f"ncbi_{marker}_hits.tsv" for marker in ("SSU", "ITS", "LSU")}
     databases = {
@@ -468,7 +542,7 @@ def main() -> None:
     taxonomy = load_taxdump(taxdump)
     all_rows = []
     for marker in ("SSU", "ITS", "LSU"):
-        marker_rows = parse_raw_hits(raw_paths[marker], marker, taxonomy)
+        marker_rows = parse_raw_hits(raw_paths[marker], marker, taxonomy, catalog_ids)
         grouped_marker = defaultdict(list)
         for row in marker_rows:
             grouped_marker[row["query"]].append(row)
