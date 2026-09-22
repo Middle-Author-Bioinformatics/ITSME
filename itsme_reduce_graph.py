@@ -10,7 +10,9 @@ Usage:
 
 Default output: RUN/final/summary_graphs (must be new or empty).
 Produces separate reduced graphs for pooled and taxon-bin assemblies, plus
-locus_nodes.tsv and report.json. Graph node IDs are local to each assembly.
+locus_nodes.tsv and report.json. Also writes graph_index.html and one
+*.sequences.tsv per graph, linking graph files to sequence IDs and taxonomy.
+Graph node IDs are local to each assembly. No extra flags are required.
 Defaults to FASTG; --format gfa selects GFA1. Explicit --graph detects format
 from content, irrespective of extension, and is only used for pooled loci.
 
@@ -29,6 +31,7 @@ produce an empty report, not an error. Existing nonempty output is never replace
 import argparse
 import csv
 import json
+import html
 import re
 import sys
 from collections import defaultdict
@@ -149,6 +152,53 @@ class Graph:
                         f.write('\t'.join(row) + '\n')
 
 
+
+SEQUENCE_FIELDS = ['locus', 'source_bin', 'graph_file', 'source', 'length_bp',
+                   'locus_type', 'mean_depth', 'taxonomy_status',
+                   'consensus_taxonomy', 'node_path']
+
+
+def write_table(path, rows, fields):
+    with path.open('w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fields, delimiter='\t', extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_graph_index(out, reports, missing):
+    """Human-readable sequence identities; taxonomy is copied, never inferred."""
+    esc = lambda value: html.escape(str(value if value is not None else ''))
+    sections = []
+    for item in reports:
+        rows = item['sequences']
+        body = ''.join('<tr>' + ''.join('<td>' + esc(r.get(k, '')) + '</td>'
+                       for k in SEQUENCE_FIELDS if k != 'graph_file') + '</tr>' for r in rows)
+        headings = ''.join('<th>' + esc(k.replace('_', ' ')) + '</th>'
+                           for k in SEQUENCE_FIELDS if k != 'graph_file')
+        sections.append('<section><h2>' + esc(item['source_bin']) + '</h2><p>Graph: <a href="' +
+                        esc(item['file']) + '">' + esc(item['file']) + '</a> | <a href="' +
+                        esc(item['sequence_table']) + '">Sequence table</a> | ' + str(len(rows)) +
+                        ' reported sequence(s); ' + str(item['retained_nodes']) +
+                        ' retained graph nodes.</p><div class="scroll"><table><thead><tr>' +
+                        headings + '</tr></thead><tbody>' + body + '</tbody></table></div></section>')
+    omitted = ('<h2>Unmapped sequences</h2><ul>' + ''.join(
+        '<li>' + esc(r['locus']) + ': ' + esc(r['reason']) + '</li>' for r in missing) + '</ul>') if missing else ''
+    page = """<!doctype html><html lang="en"><meta charset="utf-8">
+<title>ITSME graph-to-sequence index</title><style>
+body{font:15px system-ui,sans-serif;margin:30px;color:#182330}h1{font-size:26px}
+section{margin:28px 0}.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%}
+th,td{padding:10px;border:1px solid #ccd4dd;text-align:left;vertical-align:top}
+th{background:#eaf0f6}td{overflow-wrap:anywhere;min-width:100px}a{color:#0759a4}
+</style><h1>Which sequences does each graph represent?</h1>
+<p>Sequence IDs match the master summary. Source bin numbers and locus numbers are independent.
+Taxonomy and status below are copied from the summary; blank fields mean unavailable.</p>
+<p>Graphs contain shared sequence pieces, not necessarily one separate component per reported sequence.
+A shared node can belong to several reconstructions. Node IDs are local to each graph.
+Paths use source orientation, which may differ from the final FASTA orientation.
+Additional neighbor nodes, if requested, are context—not classified sequences.</p>
+""" + ''.join(sections) + omitted + '</html>'
+    (out / 'graph_index.html').write_text(page, encoding='utf-8')
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--run-dir', required=True, type=Path)
@@ -169,6 +219,12 @@ def main():
     rows, fields = table(summary)
     if 'contig' not in fields:
         raise ValueError('Summary must have a contig column')
+    metadata = {}
+    for row in rows:
+        locus = row.get('contig', '').strip()
+        if locus in metadata and metadata[locus] != row:
+            raise ValueError('Conflicting summary rows for ' + locus)
+        metadata[locus] = row
     loci = list(dict.fromkeys(r['contig'].strip() for r in rows if r.get('contig', '').strip()))
     out = (a.output_dir or final / 'summary_graphs').resolve()
     if out.exists() and (not out.is_dir() or any(out.iterdir())):
@@ -233,7 +289,11 @@ def main():
             absent = nodes - graph.nodes
             if absent:
                 raise ValueError('Path nodes absent from graph: ' + ','.join(sorted(absent)[:10]))
+            details = {key: metadata[locus].get(key, '') for key in
+                       ('length_bp', 'locus_type', 'mean_depth', 'taxonomy_status', 'consensus_taxonomy')}
             assignments.append(dict(locus=locus, source=source, graph=label,
+                                    source_bin=matches[0][1].name if matches else 'pooled',
+                                    graph_file=label + '.summary.' + graph.format, **details,
                                     source_graph=str(graph_path),
                                     node_path=';'.join(','.join(piece) for piece in pieces),
                                     nodes=nodes))
@@ -255,12 +315,20 @@ def main():
             keep.update(frontier)
         filename = label + '.summary.' + graph.format
         graph.write(out / filename, keep)
+        sequence_rows = [{k: row.get(k, '') for k in SEQUENCE_FIELDS}
+                         for row in assignments if row['graph'] == label]
+        sequence_table = label + '.sequences.tsv'
+        write_table(out / sequence_table, sequence_rows, SEQUENCE_FIELDS)
         reports.append(dict(graph=label, file=filename, source=str(graph.path),
+                            source_bin=sequence_rows[0]['source_bin'],
+                            sequence_table=sequence_table, sequences=sequence_rows,
                             original_nodes=len(graph.nodes), locus_nodes=len(selected),
                             retained_nodes=len(keep)))
     with (out / 'locus_nodes.tsv').open('w', newline='') as f:
-        fields = ['locus', 'source', 'graph', 'source_graph', 'node_path']
+        fields = ['locus', 'source', 'graph', 'source_graph', 'node_path'] + [
+            k for k in SEQUENCE_FIELDS if k not in ('locus', 'source', 'node_path')]
         w = csv.DictWriter(f, fields, delimiter='\t', extrasaction='ignore'); w.writeheader(); w.writerows(assignments)
+    write_graph_index(out, reports, missing)
     report = dict(status='partial' if missing else 'complete', summary=str(summary),
                   requested_loci=len(loci), mapped_loci=len(assignments), neighbors=a.neighbors,
                   omitted_loci=missing, graphs=reports)
@@ -268,6 +336,9 @@ def main():
     print(f"{report['status']}: mapped {len(assignments)}/{len(loci)} loci; output: {out}")
     for item in reports:
         print(f"  {item['file']}: {item['retained_nodes']}/{item['original_nodes']} nodes")
+        for row in item['sequences']:
+            print(f"    {row['locus']} | {row['length_bp']} bp | {row['consensus_taxonomy'] or 'taxonomy unavailable'}")
+    print('Open graph_index.html to see the graph-to-sequence mapping.')
     if missing:
         print('WARNING: incomplete subgraphs; see report.json for omitted loci.', file=sys.stderr)
 
