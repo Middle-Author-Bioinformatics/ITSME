@@ -2,20 +2,26 @@
 """
 Build a single standalone dashboard for browsing many ITSME graph_index.html files.
 
+By default, sample folders whose report.json indicates zero mapped sequences or zero
+graph reports are omitted from the dashboard.
+
 Expected layout:
 
 ROOT/
   itsme_SAMPLE_1/
     graph_index.html
+    report.json
     *.summary.fastg
     *.sequences.tsv
     ...
   itsme_SAMPLE_2/
     graph_index.html
+    report.json
     ...
 
-The generated dashboard embeds every graph_index.html directly into one master HTML
-and swaps the entire viewer inside a single iframe when the sample dropdown changes.
+The generated dashboard embeds every selected graph_index.html directly into one
+master HTML and swaps the entire viewer inside a single iframe when the sample
+dropdown changes.
 
 Python >= 3.9; standard library only.
 """
@@ -26,6 +32,7 @@ import argparse
 import base64
 import hashlib
 import html
+import json
 import os
 import re
 import sys
@@ -53,32 +60,76 @@ def add_base_href(page: str, base_href: str) -> str:
     return tag + page
 
 
-def discover_samples(root: Path, viewer_name: str, pattern: str | None):
-    samples = []
+def load_report(report_path: Path):
+    try:
+        return json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None
+
+
+def is_empty_report(report: dict | None) -> bool:
+    """
+    Treat a sample as empty when report.json clearly indicates nothing was mapped
+    or nothing was rendered.
+    """
+    if not isinstance(report, dict):
+        return False
+    mapped = report.get("mapped_sequences")
+    graphs = report.get("graphs")
+    if isinstance(mapped, int) and mapped == 0:
+        return True
+    if isinstance(graphs, list) and len(graphs) == 0:
+        return True
+    return False
+
+
+def discover_samples(root: Path, viewer_name: str, pattern: str | None, include_empty: bool):
+    included = []
+    skipped_empty = []
+    skipped_missing_viewer = []
+
     for child in root.iterdir():
         if not child.is_dir():
             continue
         if pattern and not child.match(pattern):
             continue
+
         viewer = child / viewer_name
-        if viewer.is_file():
-            samples.append((child.name, child, viewer))
-    samples.sort(key=lambda x: natural_key(x[0]))
-    return samples
+        if not viewer.is_file():
+            skipped_missing_viewer.append(child.name)
+            continue
+
+        report_path = child / "report.json"
+        report = load_report(report_path) if report_path.is_file() else None
+
+        if not include_empty and is_empty_report(report):
+            skipped_empty.append({
+                "name": child.name,
+                "mapped_sequences": report.get("mapped_sequences"),
+                "requested_sequences": report.get("requested_sequences"),
+                "graph_count": len(report.get("graphs", [])) if isinstance(report.get("graphs"), list) else None,
+            })
+            continue
+
+        included.append((child.name, child, viewer, report))
+
+    included.sort(key=lambda x: natural_key(x[0]))
+    skipped_empty.sort(key=lambda x: natural_key(x["name"]))
+    return included, skipped_empty, skipped_missing_viewer
 
 
-def build_dashboard(root: Path, output: Path, viewer_name: str, pattern: str | None):
-    samples = discover_samples(root, viewer_name, pattern)
+def build_dashboard(root: Path, output: Path, viewer_name: str, pattern: str | None, include_empty: bool):
+    samples, skipped_empty, skipped_missing_viewer = discover_samples(root, viewer_name, pattern, include_empty)
     if not samples:
         raise ValueError(
-            f"No immediate subfolders under {root} contained {viewer_name!r}"
-            + (f" matching pattern {pattern!r}" if pattern else "")
+            "No eligible sample folders were found. "
+            "If you want to include empty viewers, use --include-empty."
         )
 
     payload = []
     hash_groups: dict[str, list[str]] = {}
 
-    for sample_name, sample_dir, viewer_path in samples:
+    for sample_name, sample_dir, viewer_path, report in samples:
         page = viewer_path.read_text(encoding="utf-8")
         sha = hashlib.sha256(page.encode("utf-8")).hexdigest()
         hash_groups.setdefault(sha, []).append(sample_name)
@@ -93,6 +144,8 @@ def build_dashboard(root: Path, output: Path, viewer_name: str, pattern: str | N
                 "name": sample_name,
                 "sha": sha[:12],
                 "bytes": len(page.encode("utf-8")),
+                "mapped_sequences": report.get("mapped_sequences") if isinstance(report, dict) else None,
+                "graph_count": len(report.get("graphs", [])) if isinstance(report, dict) and isinstance(report.get("graphs"), list) else None,
                 "b64": base64.b64encode(page.encode("utf-8")).decode("ascii"),
             }
         )
@@ -101,9 +154,6 @@ def build_dashboard(root: Path, output: Path, viewer_name: str, pattern: str | N
         f'<option value="{i}">{html.escape(item["name"])}</option>'
         for i, item in enumerate(payload)
     )
-
-    # Base64 avoids all nested </script>, quoting, and multiline-HTML problems.
-    import json
 
     data_json = json.dumps(payload, separators=(",", ":"))
 
@@ -173,7 +223,7 @@ def build_dashboard(root: Path, output: Path, viewer_name: str, pattern: str | N
     border:0;
     background:var(--bg);
   }}
-  @media(max-width:800px) {{
+  @media(max-width:900px) {{
     .title {{ display:none; }}
     select {{ min-width:0; max-width:none; flex:1; }}
     .meta {{ display:none; }}
@@ -192,6 +242,10 @@ def build_dashboard(root: Path, output: Path, viewer_name: str, pattern: str | N
   <div class="meta">
     <span id="counter"></span>
     &nbsp;·&nbsp;
+    graphs <span id="graphCount"></span>
+    &nbsp;·&nbsp;
+    mapped <span id="mappedCount"></span>
+    &nbsp;·&nbsp;
     HTML <span class="hash" id="hash"></span>
   </div>
 </div>
@@ -207,6 +261,8 @@ const prev = document.getElementById("prev");
 const next = document.getElementById("next");
 const counter = document.getElementById("counter");
 const hash = document.getElementById("hash");
+const graphCount = document.getElementById("graphCount");
+const mappedCount = document.getElementById("mappedCount");
 
 function decodeUtf8Base64(b64) {{
   const binary = atob(b64);
@@ -226,6 +282,8 @@ function loadSample(index) {{
 
   counter.textContent = `${{index + 1}} / ${{SAMPLES.length}}`;
   hash.textContent = item.sha;
+  graphCount.textContent = item.graph_count ?? "NA";
+  mappedCount.textContent = item.mapped_sequences ?? "NA";
   prev.disabled = index === 0;
   next.disabled = index === SAMPLES.length - 1;
 
@@ -258,19 +316,42 @@ loadSample(0);
     output.write_text(master, encoding="utf-8")
 
     print(f"Wrote: {output}")
-    print(f"Embedded {len(payload)} sample viewer(s):")
+    print(f"Included {len(payload)} sample viewer(s):")
     for item in payload:
-        print(f"  {item['name']}  sha256={item['sha']}  embedded={item['bytes']:,} bytes")
+        extra = []
+        if item["graph_count"] is not None:
+            extra.append(f"graphs={item['graph_count']}")
+        if item["mapped_sequences"] is not None:
+            extra.append(f"mapped={item['mapped_sequences']}")
+        extra_txt = "  " + "  ".join(extra) if extra else ""
+        print(f"  {item['name']}  sha256={item['sha']}  embedded={item['bytes']:,} bytes{extra_txt}")
+
+    if skipped_empty:
+        print(f"\nSkipped {len(skipped_empty)} sample(s) with no reconstructed sequences / no graph reports:")
+        for row in skipped_empty:
+            detail = []
+            if row["requested_sequences"] is not None:
+                detail.append(f"requested={row['requested_sequences']}")
+            if row["mapped_sequences"] is not None:
+                detail.append(f"mapped={row['mapped_sequences']}")
+            if row["graph_count"] is not None:
+                detail.append(f"graphs={row['graph_count']}")
+            print(f"  {row['name']}" + (f"  ({', '.join(detail)})" if detail else ""))
 
     duplicates = [names for names in hash_groups.values() if len(names) > 1]
     if duplicates:
-        print("\nWARNING: some graph_index.html files are byte-for-byte identical:")
+        print("\nWARNING: some INCLUDED graph_index.html files are byte-for-byte identical:")
         for names in duplicates:
             print("  " + ", ".join(names))
         print(
             "If those samples are expected to differ, inspect the per-sample "
             "graph_index.html generation before blaming the dashboard."
         )
+
+    if skipped_missing_viewer:
+        print(f"\nIgnored {len(skipped_missing_viewer)} subfolder(s) with no {viewer_name}:")
+        for name in sorted(skipped_missing_viewer, key=natural_key):
+            print(f"  {name}")
 
 
 def main():
@@ -298,6 +379,11 @@ def main():
         default=None,
         help="Optional subfolder glob, e.g. 'itsme_*'.",
     )
+    p.add_argument(
+        "--include-empty",
+        action="store_true",
+        help="Include samples even when report.json shows zero mapped sequences or zero graphs.",
+    )
     args = p.parse_args()
 
     root = args.root.expanduser().resolve()
@@ -314,7 +400,7 @@ def main():
         p.error(f"Output is a directory: {output}")
 
     try:
-        build_dashboard(root, output, args.viewer, args.pattern)
+        build_dashboard(root, output, args.viewer, args.pattern, args.include_empty)
     except (OSError, ValueError, UnicodeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
